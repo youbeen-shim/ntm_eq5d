@@ -2,3 +2,54 @@
 title: "EDA"
 output: html_notebook
 ---
+
+```{r}
+library(tidyverse)
+library(haven)
+
+df <- read_csv("NTM_KOREA_subdata.csv")
+```
+
+```{r}
+table(df$IEIN1)
+table(df$IEIN2)
+table(df$IEIN3)
+table(df$IEIN4)
+table(df$IEIN5)
+table(df$IEEX1) # What's the point?
+```
+
+
+```{r}
+# QOL-B 시행 여부	
+table(df$QSQBYN)
+```
+
+```{r}
+# EQ-5D-5L 시행 여부
+table(df$QSEQYN)
+```
+
+```{r}
+# IPAQ-SF 시행 여부	
+table(df$QSPAYN)
+
+# MNA 시행 여부	
+table(df$QSMNAYN)
+
+# Nutrition evaluation 시행 여부	
+table(df$MLEVL)
+```
+
+```{r}
+# Study Termination - No meaningful results
+
+# Date of study termination	DSDTC & DSTERM_A
+table(df$DSTERM) # 3 = Withdrawal of study participation; 30
+table(df$DSTERM_A)
+
+# Died due to NTM-PD	DSDTHNTM
+table(df$DSDTHNTM)
+```
+
+
