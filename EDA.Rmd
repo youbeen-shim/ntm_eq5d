@@ -6,6 +6,7 @@ output: html_notebook
 ```{r}
 library(tidyverse)
 library(haven)
+library(ggplot2)
 
 df <- read_csv("NTM_KOREA_subdata.csv")
 ```
@@ -50,6 +51,196 @@ table(df$DSTERM_A)
 
 # Died due to NTM-PD	DSDTHNTM
 table(df$DSDTHNTM)
+```
+
+Created Features, 구동형 선생님 
+Durations 
+```{r}
+# 약제 투약 기간. CMENDTC - CMSTDTC 로 계산함.
+# CMTRDUR_x where x = 1:43
+hist(df$CMTRDUR_1)
+
+# 치료 개시일 (SSTRDTC) 로부터 특정 약제 투약 시작일 (CMSTDTC) 까지 차이 기간
+# CMSTDUR_x where x = 1:43
+table(df$CMSTDUR_1) #    0: 1360, 91: 5
+
+# 특정 약제 투약 시작일 (CMSTDTC) 로부터 특정 약제 투약 종료일 (CMENDTC) 까지 차이 기간
+# CMENDUR_x where 1 = 1:43
+hist(df$CMENDUR_1)
+
+# 치료 개시일 (SSTRDTC) 로부터 균검사일 (MBDTC) 까지 차이 기간
+# MBDUR__x where x = 1:26
+hist(df$MBDUR__1)
+
+
+# 첫 진단일 (MBDXDTC) 로부터 치료개시일 (SSTRDTC) 까지 차이 기간
+hist(df$SSDXTRDUR, 15) 
+# NOTE: Has negative values
+
+# 치료 개시일 (SSTRDTC) 로부터 배양음전일 (culture conversion 된 날짜) (MBCNEGDTC) 까지 차이 기간
+hist(df$MBCNEGDUR)
+```
+
+Created Features, Classification
+```{r}
+# B=baseline|6M=1번째 추적관찰|1Y=2번째 추적관찰|18M=3번째 추적관찰|2Y=4번째 추적관찰
+table(df$time)
+
+# MBEDX 자료로 NTM 균 종류를 2가지로 분류
+table(df$MBSPECIES)
+
+# MBEDX 자료로 NTM 균 종류를 3가지로 분류
+table(df$MBSUBSPECIES)
+```
+
+```{r}
+# max(QSEQDTC) - min(QSEQDTC) 로 계산한 추적관찰기간
+hist(df$QSEQFUDAYS)
+sum(!is.na(df$QSEQFUDAYS)) # ? why is this value 1635, when
+length(unique(df$SUBJNO)) # is 327
+
+test <- df %>%
+  filter(SUBJNO == 'AMC-S001')
+table(test$time, test$QSEQFUDAYS) # all same, meaning the values are same for a given individual
+```
+
+```{r}
+# QALY Survey Responses
+print(test$QSEQ1)
+print(test$QSEQ2)
+print(test$QSEQ3)
+print(test$QSEQ4)
+print(test$QSEQ5)
+
+# QALY 지수
+hist(df$QSEQQALY)
+table(test$time, test$QSEQQALY) # Changing QALY
+table(df$QSEQQALY)
+
+# QSEQQALY (HRQoL value), QSEQFUDAYS (time) 를 사용해 계산한 QALY 값
+# Σ { (value_i+value_(i+1)) /2 * time }
+hist(df$QSEQQALY_TOT2, 20)
+table(test$time, test$QSEQQALY_TOT2) # AVG QALY
+
+length(!is.na(df$QSEQQALY_TOT2)) # 1635
+
+```
+
+```{r}
+# average QALY weight = average HRQoL 계산
+# QSEQQALY_TOT2 / QSEQFUDAYS
+hist(df$QSEQQALY_TOT_NORM2)
+table(test$time, test$QSEQQALY_TOT_NORM2)
+```
+```{r}
+temp <- df %>%
+  mutate(time_factor = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  group_by(time_factor, CMQUIT_GROUP_2) %>%
+  summarise(
+    QALY_AVG = mean(QSEQQALY, na.rm = TRUE),
+    SD = sd(QSEQQALY, na.rm = TRUE),
+    N = sum(!is.na(QSEQQALY)), # Count of non-NA values
+    SE = SD / sqrt(N), 
+    CI95_lower = QALY_AVG - 1.96 * SE,
+    CI95_upper = QALY_AVG + 1.96 * SE
+  )
+
+# Plotting helper variables
+dodge_width <- 0.2 # Error Bars
+
+group_labels <- c( # Group Labels
+  "A" = "A: Culture conversion achieved with maintained treatment",
+  "B" = "B: Culture conversion failed with maintained treatment",
+  "C" = "C: Treatment halted"
+) 
+
+# Plot 0: base plot, just QALY
+plot_base <- ggplot(temp, aes(x = time_factor, y = QALY_AVG, 
+                 group = CMQUIT_GROUP_2, color = CMQUIT_GROUP_2)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values = c("A" = "red", "B" = "blue", "C" = "green"), 
+                     labels = group_labels) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(size = 10), # Adjust legend title size
+    legend.text = element_text(size = 8)   # Adjust legend text size
+  ) +
+  labs(title = "QALY Averages",
+       y = "QALY_AVG", x = "Time",
+       color = "Culture Conversion and Treatment Status")
+
+# Plot 1: Error bars showing Standard Deviation
+plot_sd <- ggplot(temp, aes(x = time_factor, y = QALY_AVG, 
+                            group = CMQUIT_GROUP_2, color = CMQUIT_GROUP_2)) +
+  geom_point(size = 2) +
+  geom_line() +
+  geom_errorbar(aes(ymin = QALY_AVG - SD, ymax = QALY_AVG + SD), 
+                position = position_dodge(width = dodge_width), 
+                width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("A" = "red", "B" = "blue", "C" = "green"), 
+                     labels = group_labels) +
+  theme_minimal() +
+    theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(size = 10), # Adjust legend title size
+    legend.text = element_text(size = 8)   # Adjust legend text size
+  ) +
+  labs(title = "QALY Averages with Standard Deviation",
+       y = "QALY_AVG", x = "Time",
+       color = "Culture Conversion and Treatment Status")
+
+# Plot 2: Error bars showing 95% Confidence Intervals
+plot_ci <- ggplot(temp, aes(x = time_factor, y = QALY_AVG, 
+                            group = CMQUIT_GROUP_2, color = CMQUIT_GROUP_2)) +
+  geom_point(size = 2) +
+  geom_line() +
+  geom_errorbar(aes(ymin = CI95_lower, ymax = CI95_upper), 
+                position = position_dodge(width = dodge_width), 
+                width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("A" = "red", "B" = "blue", "C" = "green"), 
+                     labels = group_labels) +
+  theme_minimal() +
+    theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(size = 10), # Adjust legend title size
+    legend.text = element_text(size = 8)   # Adjust legend text size
+  ) +
+  labs(title = "QALY Averages with 95% Confidence Intervals",
+       y = "QALY_AVG", x = "Time",
+       color = "Culture Conversion and Treatment Status")
+
+# Display the two plots
+print(plot_base)
+print(plot_sd)
+print(plot_ci)
+```
+
+
+Created Features, Related ot EQ5D
+```{r}
+# 치료 개시일 (SSTRDTC) 로부터 각 EQ-5D-5L 검사 날짜 (QSEQDTC) 까지 차이 기간
+hist(df$QSEQDUR)
+
+# 첫 EQ-5D-5L 날짜 (min(QSEQDTC)) 로부터 각 EQ-5D-5L 검사 날짜 (QSEQDTC) 까지 차이 기간
+hist(df$QSEQDUR_diff)
+
+# BACES score (mortality 예측 도구)
+sum(is.na(df$BACES)) # 1323
+table(df$BACES)
+
+# EQ-5D-5L 로 환산한 HRQoL (=QALY weight)
+hist(df$QSEQQALY, 15)
+
+# Classified into three groups according to 1) culture conversion status and 2) whether the treatment needed to be discontinued earlier than planned
+# A : Culture conversion achieved with maintained treatment
+# B : Culture conversion failed with maintained treatment (including treatment failure)
+# C : Treatment halted
+table(df$CMQUIT_GROUP_2)
 ```
 
 
