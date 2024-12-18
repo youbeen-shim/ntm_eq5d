@@ -243,4 +243,124 @@ hist(df$QSEQQALY, 15)
 table(df$CMQUIT_GROUP_2)
 ```
 
+```{r}
+# QALY Survey Responses
+hist(df$QSEQ1, 5)
+hist(df$QSEQ2, 5)
+hist(df$QSEQ3, 5)
+hist(df$QSEQ4, 5)
+hist(df$QSEQ5, 5)
+```
+
+```{r}
+tidy_df <- df %>%
+  select(SUBJNO, time, QSEQ1, QSEQ2, QSEQ3, QSEQ4, QSEQ5) %>%
+  mutate(time_factor = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  pivot_longer(cols = QSEQ1:QSEQ5, names_to = "question", values_to = "score")
+
+# Calculate variance for each question
+variance_df <- tidy_df %>%
+  group_by(question) %>%
+  summarize(variance = var(score, na.rm = TRUE), .groups = "drop")
+
+# Plot variance for each question
+variance_plot <- variance_df %>%
+  ggplot(aes(x = question, y = variance, fill = question)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(
+    title = "Variance of Scores by Question",
+    x = "Question",
+    y = "Variance",
+    fill = "Question"
+  )
+
+plot(variance_plot)
+```
+```{r}
+# Part 1: Variance of Scores by Time Period
+# Calculate variance per question and time period
+variance_by_time <- df %>%
+  select(SUBJNO, time, QSEQ1, QSEQ2, QSEQ3, QSEQ4, QSEQ5) %>%
+  mutate(time_factor = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  pivot_longer(cols = QSEQ1:QSEQ5, names_to = "question", values_to = "score") %>%
+  group_by(time_factor, question) %>%
+  summarize(variance = var(score, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = question, values_from = variance)
+
+# Tidy format for plotting
+variance_tidy <- df %>%
+  select(SUBJNO, time, QSEQ1, QSEQ2, QSEQ3, QSEQ4, QSEQ5) %>%
+  mutate(time_factor = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  pivot_longer(cols = QSEQ1:QSEQ5, names_to = "question", values_to = "score") %>%
+  group_by(time_factor, question) %>%
+  summarize(variance = var(score, na.rm = TRUE), .groups = "drop")
+
+# Plot variance by time period
+variance_plot <- variance_tidy %>%
+  ggplot(aes(x = time_factor, y = variance, fill = question)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Variance of Scores by Time Period",
+    x = "Time Period",
+    y = "Variance",
+    fill = "Question"
+  )
+
+print(variance_plot)
+```
+```{r}
+# Part 2: Variance of Score Changes Across Time Periods
+# Calculate score differences and label time comparisons
+score_differences <- df %>%
+  select(SUBJNO, time, QSEQ1, QSEQ2, QSEQ3, QSEQ4, QSEQ5) %>%
+  mutate(time_factor = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  arrange(SUBJNO, time_factor) %>%
+  group_by(SUBJNO) %>%
+  mutate(across(QSEQ1:QSEQ5, ~ .x - lag(.x), .names = "diff_{col}")) %>%
+  mutate(
+    time_comparison = case_when(
+      time_factor == "6M" ~ "B to 6M",
+      time_factor == "1Y" ~ "6M to 1Y",
+      time_factor == "18M" ~ "1Y to 18M",
+      time_factor == "2Y" ~ "18M to 2Y",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(time_comparison = factor(time_comparison, 
+                                  levels = c("B to 6M", "6M to 1Y", 
+                                             "1Y to 18M", "18M to 2Y"))) %>%
+  filter(!is.na(time_comparison)) %>%
+  select(SUBJNO, time_comparison, starts_with("diff"))
+
+# Calculate variance of changes across patients
+variance_of_changes <- score_differences %>%
+  pivot_longer(cols = starts_with("diff"), names_to = "question", values_to = "change") %>%
+  group_by(time_comparison, question) %>%
+  summarize(variance = var(change, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = question, values_from = variance)
+
+# Tidy format for plotting
+variance_changes_tidy <- score_differences %>%
+  pivot_longer(cols = starts_with("diff"), names_to = "question", values_to = "change") %>%
+  group_by(time_comparison, question) %>%
+  summarize(variance = var(change, na.rm = TRUE), .groups = "drop")
+
+# Plot variance of changes
+variance_changes_plot <- variance_changes_tidy %>%
+  ggplot(aes(x = time_comparison, y = variance, fill = question)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Variance of Score Changes Across Time Periods",
+    x = "Time Comparison",
+    y = "Variance of Changes",
+    fill = "Question"
+  )
+
+print(variance_changes_plot)
+```
+
+
 
