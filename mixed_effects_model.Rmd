@@ -16,7 +16,17 @@ and fitted to Korean standards based on prior research.
 will likely be significant
 
 ```{r}
+library(tidyverse)
+library(haven)
 library(lme4)
+library(lmerTest)  
+library(sjPlot) 
+library(ggplot2)
+```
+
+
+```{r}
+df <- read_csv("NTM_KOREA_subdata.csv")
 
 model_data <- df %>%
   select(SUBJNO, time, CMQUIT_GROUP_2, QSEQQALY,
@@ -24,12 +34,52 @@ model_data <- df %>%
   mutate(time = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
   mutate(patient_group = as.factor(CMQUIT_GROUP_2)) %>%
   select(-CMQUIT_GROUP_2)
+```
+```{r}
+# longitudinal plot for reference
+ggplot(model_data, aes(x = time, y = QSEQQALY, color = patient_group)) +
+  stat_summary(fun = mean, geom = "point") +
+  stat_summary(fun = mean, geom = "line", aes(group = patient_group)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, position = position_dodge(width = .1)) +
+  theme_minimal() +
+  labs(title = "EQ-5D-5L Scores Over Time by Patient Group",
+       y = "EQ-5D-5L Score",
+       x = "Time Point")
+```
 
-print(model_data)
 
-model <- lmer(QSEQQALY ~ QSEQ1 + QSEQ2 + QSEQ3 + QSEQ4 + QSEQ5 + 
-              CMQUIT_GROUP_2 * time + 
-              (1|SUBJNO),
-              data = model_data)
+```{r}
+eq5d_model <- lmer(QSEQQALY ~ 
+                   QSEQ1 + QSEQ2 + QSEQ3 + QSEQ4 + QSEQ5 +  # Dimension scores
+                   time + patient_group +                   # Fixed effects
+                   (1|SUBJNO),                              # Random intercept for each patient
+                   data = model_data)
+
+summary(eq5d_model)
+```
+
+```{r}
+# Check model assumptions
+plot(eq5d_model)  # Residual plots
+
+# Check for multicollinearity
+library(car)
+vif(eq5d_model)
+
+# Extract random effects
+ranef(eq5d_model)
+```
+```{r}
+# Standardize predictors for comparable coefficients
+model_data_scaled <- model_data %>%
+  mutate(across(starts_with("QSEQ"), scale))
+
+eq5d_model_scaled <- lmer(QSEQQALY ~ 
+                         QSEQ1 + QSEQ2 + QSEQ3 + QSEQ4 + QSEQ5 +
+                         time + patient_group +
+                         (1|SUBJNO),
+                         data = model_data_scaled)
+summary(eq5d_model_scaled)
 ```
 
