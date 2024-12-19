@@ -1,0 +1,35 @@
+---
+title: "Theoretical Modeling"
+output: html_notebook
+---
+
+Idea: 
+Explore the impact of QSEQ1~5 on EQ5D
+
+Model:
+Linear Regression -> 
+
+Problem: 
+- Do not know the weights of QSEQ1~5, which are modeled off of EuroQoL research 
+and fitted to Korean standards based on prior research.
+- Ignoring the impact of demographic and medical qualities of patients, which 
+will likely be significant
+
+```{r}
+library(lme4)
+
+model_data <- df %>%
+  select(SUBJNO, time, CMQUIT_GROUP_2, QSEQQALY,
+         QSEQ1, QSEQ2, QSEQ3, QSEQ4, QSEQ5) %>%
+  mutate(time = factor(time, levels = c("B", "6M", "1Y", "18M", "2Y"))) %>%
+  mutate(patient_group = as.factor(CMQUIT_GROUP_2)) %>%
+  select(-CMQUIT_GROUP_2)
+
+print(model_data)
+
+model <- lmer(QSEQQALY ~ QSEQ1 + QSEQ2 + QSEQ3 + QSEQ4 + QSEQ5 + 
+              CMQUIT_GROUP_2 * time + 
+              (1|SUBJNO),
+              data = model_data)
+```
+
