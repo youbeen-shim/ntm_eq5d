@@ -97,6 +97,10 @@ table(df$MBSUBSPECIES)
 ini <- df %>% 
   filter(time == 'B')
 table(ini$CMQUIT_GROUP_2)
+
+ini5 <- df %>%
+  filter(time == '2Y')
+table(ini5$CMQUIT_GROUP_2)
 ```
 
 
