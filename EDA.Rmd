@@ -94,6 +94,13 @@ table(df$MBSUBSPECIES)
 ```
 
 ```{r}
+ini <- df %>% 
+  filter(time == 'B')
+table(ini$CMQUIT_GROUP_2)
+```
+
+
+```{r}
 # max(QSEQDTC) - min(QSEQDTC) 로 계산한 추적관찰기간
 hist(df$QSEQFUDAYS)
 sum(!is.na(df$QSEQFUDAYS)) # ? why is this value 1635, when
