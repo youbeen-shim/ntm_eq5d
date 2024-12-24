@@ -35,7 +35,7 @@ model_data <- df %>%
   mutate(patient_group = as.factor(CMQUIT_GROUP_2)) %>%
   select(-CMQUIT_GROUP_2)
 ```
-```{r}
+```{r, warning=FALSE}
 # longitudinal plot for reference
 ggplot(model_data, aes(x = time, y = QSEQQALY, color = patient_group)) +
   stat_summary(fun = mean, geom = "point") +
@@ -47,27 +47,47 @@ ggplot(model_data, aes(x = time, y = QSEQQALY, color = patient_group)) +
        y = "EQ-5D-5L Score",
        x = "Time Point")
 ```
+# Mixed-Effects Model Structure:
 
+Fixed effects: 
+The dimension scores (QSEQ1-5), time points, and patient groups
+Random effects: 
+Patient-specific intercepts to account for within-subject correlation
+(This structure acknowledges that measurements from the same patient are related)
 
 ```{r}
 eq5d_model <- lmer(QSEQQALY ~ 
                    QSEQ1 + QSEQ2 + QSEQ3 + QSEQ4 + QSEQ5 +  # Dimension scores
-                   time + patient_group +                   # Fixed effects
+                   time + patient_group +                   
                    (1|SUBJNO),                              # Random intercept for each patient
                    data = model_data)
 
 summary(eq5d_model)
 ```
+Model Interpretation:
+> coefficients for QSEQ1-5 = how much each dimension contributes to the overall EQ-5D score
+> time coefficients = show the temporal trend in scores
+> patient_group coefficients = systematic differences between groups
+> random effects = how much individual patients deviate from the population average
 
+
+ToDo: 
+- Check if the residuals are normally distributed & homoscedastic
+- Look for any systematic patterns in the random effects
+- Examine the VIF values for multicollinearity; Note: values > 5 suggest problems
+- Consider if the linear relationship assumption holds => Appears mostly linear
 ```{r}
-# Check model assumptions
-plot(eq5d_model)  # Residual plots
+#  Residual plots
+plot(eq5d_model) 
+# Not homoscedastic 
+# - probably b/c i'm not using the tobit model to account for the cutoff value of 1.0
+# Appears somewhat normally distrubuted
 
 # Check for multicollinearity
 library(car)
 vif(eq5d_model)
 
-# Extract random effects
+# random effects (= how much individual patients deviate from the population average)
 ranef(eq5d_model)
 ```
 ```{r}
