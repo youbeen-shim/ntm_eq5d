@@ -85,6 +85,7 @@ Created Features, Classification
 ```{r}
 # B=baseline|6M=1번째 추적관찰|1Y=2번째 추적관찰|18M=3번째 추적관찰|2Y=4번째 추적관찰
 table(df$time)
+table(df$MBSPECIES)
 
 # MBEDX 자료로 NTM 균 종류를 2가지로 분류
 table(df$MBSPECIES)
