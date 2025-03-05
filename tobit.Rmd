@@ -1,0 +1,225 @@
+---
+title: "modeling"
+author: "Youbeen Shim"
+date: "2025-03-04"
+output: html_document
+---
+
+```{r}
+# Install and load the required package for Tobit regression
+if (!require(AER)) install.packages("AER")
+library(AER)  # Contains the tobit() function
+
+#########################################
+# Tobit regression for QALY data with upper limit of 1
+#########################################
+
+# Filter data for analysis
+tobit_data <- data_18mfu_2ydel_2 %>%
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365)
+
+# Create dummies for treatment groups (if needed)
+tobit_data <- tobit_data %>%
+  mutate(
+    group_A = ifelse(CMQUIT_GROUP_2 == "A", 1, 0),
+    group_B = ifelse(CMQUIT_GROUP_2 == "B", 1, 0),
+    group_C = ifelse(CMQUIT_GROUP_2 == "C", 1, 0)
+  )
+
+# Basic Tobit model for each group separately
+# Group A
+tobit_A <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "A"), 
+                 left = 0, right = 1)
+
+# Group B
+tobit_B <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "B"), 
+                 left = 0, right = 1)
+
+# Group C
+tobit_C <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "C"), 
+                 left = 0, right = 1)
+
+# Combined model with interaction terms
+tobit_combined <- tobit(QSEQQALY ~ time_years * CMQUIT_GROUP_2, 
+                        data = tobit_data, 
+                        left = 0, right = 1)
+
+# Display model summaries
+summary(tobit_A)
+summary(tobit_B)
+summary(tobit_C)
+summary(tobit_combined)
+
+#########################################
+# Generate predictions from Tobit models for visualization
+#########################################
+
+# Function to generate predictions from Tobit model
+predict_tobit <- function(model, newdata) {
+  # Get predicted values (these will be the latent variable predictions)
+  pred <- predict(model, newdata = newdata, type = "response")
+  
+  # Apply censoring manually to match Tobit assumptions
+  pred[pred < 0] <- 0
+  pred[pred > 1] <- 1
+  
+  return(pred)
+}
+
+# Create sequence of time points for predictions
+time_seq <- seq(min(tobit_data$time_years, na.rm = TRUE), 
+                max(tobit_data$time_years, na.rm = TRUE), 
+                length.out = 100)
+
+# Generate predictions for each group
+# Group A
+pred_data_A <- data.frame(time_years = time_seq)
+pred_data_A$pred_QSEQQALY <- predict_tobit(tobit_A, newdata = pred_data_A)
+pred_data_A$CMQUIT_GROUP_2 <- "A"
+
+# Group B
+pred_data_B <- data.frame(time_years = time_seq)
+pred_data_B$pred_QSEQQALY <- predict_tobit(tobit_B, newdata = pred_data_B)
+pred_data_B$CMQUIT_GROUP_2 <- "B"
+
+# Group C
+pred_data_C <- data.frame(time_years = time_seq)
+pred_data_C$pred_QSEQQALY <- predict_tobit(tobit_C, newdata = pred_data_C)
+pred_data_C$CMQUIT_GROUP_2 <- "C"
+
+# Combine predictions
+tobit_predictions <- rbind(pred_data_A, pred_data_B, pred_data_C)
+
+#########################################
+# Visualize Tobit regression results
+#########################################
+
+# Define group colors (same as your original code)
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
+
+# Create plot of Tobit regression results
+ggplot() +
+  # Add raw data points with slight transparency
+  geom_point(data = tobit_data, 
+             aes(x = time_years, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1) +
+  # Add Tobit regression lines
+  geom_line(data = tobit_predictions, 
+            aes(x = time_years, y = pred_QSEQQALY, color = CMQUIT_GROUP_2), 
+            size = 1) +
+  # Styling
+  scale_color_manual(values = group_colors) +
+  ylim(0.75, 1) +
+  labs(title = "Tobit Regression of Health-Related Quality of Life by Treatment Group", 
+       subtitle = "Accounting for censoring at QALY = 1",
+       x = "Time (years)", 
+       y = "QALY weight") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_classic() +
+  theme(
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "bottom"
+  )
+
+#########################################
+# Calculate AUC based on Tobit regression
+#########################################
+
+# Determine common time window for AUC calculation
+min_max_time <- min(
+  max(subset(tobit_data, CMQUIT_GROUP_2 == "A")$time_years, na.rm = TRUE),
+  max(subset(tobit_data, CMQUIT_GROUP_2 == "B")$time_years, na.rm = TRUE),
+  max(subset(tobit_data, CMQUIT_GROUP_2 == "C")$time_years, na.rm = TRUE)
+)
+
+# Create fine-grained time sequence for precise AUC calculation
+fine_time_seq <- seq(0, min_max_time, length.out = 500)
+
+# Function to calculate AUC from Tobit model
+calculate_tobit_auc <- function(model, time_seq) {
+  # Create prediction data
+  pred_data <- data.frame(time_years = time_seq)
+  
+  # Get predictions
+  pred_data$pred_QSEQQALY <- predict_tobit(model, newdata = pred_data)
+  
+  # Calculate trapezoid areas
+  areas <- numeric(length(time_seq) - 1)
+  for(i in 1:(length(time_seq) - 1)) {
+    # Area of trapezoid
+    areas[i] <- (time_seq[i+1] - time_seq[i]) * 
+                (pred_data$pred_QSEQQALY[i] + pred_data$pred_QSEQQALY[i+1]) / 2
+  }
+  
+  # Sum all areas
+  return(sum(areas))
+}
+
+# Calculate AUC for each group
+auc_A <- calculate_tobit_auc(tobit_A, fine_time_seq)
+auc_B <- calculate_tobit_auc(tobit_B, fine_time_seq)
+auc_C <- calculate_tobit_auc(tobit_C, fine_time_seq)
+
+# Create AUC results data frame
+auc_results <- data.frame(
+  CMQUIT_GROUP_2 = c("A", "B", "C"),
+  AUC = c(auc_A, auc_B, auc_C)
+)
+
+# Display AUC results
+print(auc_results)
+
+# Statistical comparison of AUCs
+# For this, you might consider bootstrapping to generate confidence intervals
+# This would require additional code using the boot package
+
+#########################################
+# Create filled area plot with Tobit regression
+#########################################
+
+# Generate prediction data for visualization
+tobit_auc_viz <- data.frame()
+
+for(group in c("A", "B", "C")) {
+  # Select appropriate model
+  model <- switch(group,
+                 "A" = tobit_A,
+                 "B" = tobit_B,
+                 "C" = tobit_C)
+  
+  # Create prediction data
+  pred_data <- data.frame(time_years = fine_time_seq)
+  
+  # Get predictions
+  pred_data$pred_QSEQQALY <- predict_tobit(model, newdata = pred_data)
+  pred_data$CMQUIT_GROUP_2 <- group
+  
+  # Append to visualization data
+  tobit_auc_viz <- rbind(tobit_auc_viz, pred_data)
+}
+
+# Create filled area plot
+ggplot(tobit_auc_viz, aes(x = time_years, y = pred_QSEQQALY, 
+                          color = CMQUIT_GROUP_2, fill = CMQUIT_GROUP_2)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymax = pred_QSEQQALY, ymin = 0), alpha = 0.3, color = NA) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  labs(title = "Tobit Regression of HRQoL by Group with AUC", 
+       subtitle = paste("AUC values: A =", round(auc_A, 3), 
+                        ", B =", round(auc_B, 3), 
+                        ", C =", round(auc_C, 3)),
+       x = "Time (years)", 
+       y = "QALY weight") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_classic() +
+  theme(
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "bottom"
+  )
+```
+
