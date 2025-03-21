@@ -1,0 +1,345 @@
+---
+title: "treatment decision making"
+author: "Youbeen Shim"
+date: "2025-03-21"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(lme4)
+library(lmerTest)  
+library(sjPlot) 
+library(ggplot2)
+library(dplyr)
+```
+
+```{r}
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+# A: 77  B: 62  C: 47 = total 186 명
+table(data$CMQUIT_GROUP_2)
+table(data$time)
+```
+
+```{r}
+# Key Variables
+# MBSPECIES + AGE + SEX + DMSMKEVER + MHTBTX + MHTNTX + MHCOPD + MHASTH + MHILD + MHBE + MHCPA + MHLCA + MHDM + MHRA + MHCLD + MHCKD + MHCV + MHMAL + MBDXSPRYN + MBEDX + MBDXCO + MBDXAVC + MBDXICL + MBDXASA + MBDXASM + MBDXOTH + RFCTFD + RFCTCAVI + VSWEIGHT + VSBMI + LBWBC + LBALB + LBESR + LBCRP + FTPFFEV + FTPFFEVP + FTPFFVC + FTPFFVCP + FTPFFEVC + FTPFDLCO + FT6MWT + BACES + CMQUIT_GROUP_2 + MBDXCO2
+```
+
+
+LOESS Regression, Longitudinal Analysis of Quality of Life
+```{r}
+# Prepare data - filter out rows with missing values for duration or quality of life score
+data_filtered <- data %>%
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY))
+
+# LOESS regression for each treatment response group
+loess_results <- data_filtered %>%
+  group_by(CMQUIT_GROUP_2) %>%
+  do({
+    # Fit LOESS model for current group
+    loess_fit <- loess(QSEQQALY ~ QSEQDUR_diff, data = ., 
+                      span = 0.75)  # Adjust span parameter as needed for smoothness
+    # Create sequence of time points for prediction
+    time_seq <- seq(min(.$QSEQDUR_diff), max(.$QSEQDUR_diff), length.out = 100)
+    
+    # predictions (with standard errors)
+    pred_vals <- predict(loess_fit, 
+                        newdata = data.frame(QSEQDUR_diff = time_seq), 
+                        se = TRUE)
+    # predictions & 95% CI
+    data.frame(
+      QSEQDUR_diff = time_seq,
+      loess_fit = pred_vals$fit,
+      lower_bound = pred_vals$fit - 1.96 * pred_vals$se.fit,  # 95% CI lower bound
+      upper_bound = pred_vals$fit + 1.96 * pred_vals$se.fit   # 95% CI upper bound
+    )
+  }) %>%
+  ungroup()
+
+
+# Create visualization of LOESS regression results
+loess_plot <- ggplot() +
+  # regression lines for each group
+  geom_line(data = loess_results, 
+            aes(x = QSEQDUR_diff/365, y = loess_fit, color = CMQUIT_GROUP_2), 
+            linewidth = 1) +
+  # confidence interval ribbons
+  geom_ribbon(data = loess_results, 
+              aes(x = QSEQDUR_diff/365, 
+                  ymin = lower_bound, 
+                  ymax = upper_bound, 
+                  fill = CMQUIT_GROUP_2), 
+              alpha = 0.2) +
+  labs(title = "Health-Related Quality of Life Trends by Treatment Response Group", 
+       x = "Time (years)", 
+       y = "QALY weight",
+       color = "Response Group",
+       fill = "Response Group") +
+  # Set y-axis limits and break to focus on relevant range
+  # scale_y_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0.7, 1)) +
+  # other options
+  scale_fill_manual(values = group_colors) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10)
+  )
+
+print(loess_plot)
+```
+
+Tobit Regression, QALY data with upper limit of 1
+
+Note: two errors
+1) Ignoring data structure: treated observations as independent despite having 4 measurements per individual over time (baseline, 6M, 1Y, 18M), violating independence assumptions in regression
+2) Separate models by group: fit separate Tobit models for each treatment group. failed to pool information across groups and didn't account for within-subject correlation.
+```{r}
+library(AER) 
+# Tobit regression for QALY data with upper limit of 1
+
+# Filter data for analysis
+tobit_data <- data %>%
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365)
+
+# Basic Tobit model for each group separately
+# Group A
+tobit_A <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "A"), 
+                 left = 0, right = 1)
+
+# Group B
+tobit_B <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "B"), 
+                 left = 0, right = 1)
+
+# Group C
+tobit_C <- tobit(QSEQQALY ~ time_years, data = subset(tobit_data, CMQUIT_GROUP_2 == "C"), 
+                 left = 0, right = 1)
+
+# Combined model with interaction terms
+tobit_combined <- tobit(QSEQQALY ~ time_years * CMQUIT_GROUP_2, 
+                        data = tobit_data, 
+                        left = 0, right = 1)
+
+# model summaries
+summary(tobit_A)
+summary(tobit_B)
+summary(tobit_C)
+summary(tobit_combined)
+```
+Generate predictions from Tobit models (for visualization)
+```{r}
+# Function to generate predictions
+predict_tobit <- function(model, newdata) {
+  # Get predicted values (these will be the latent variable predictions)
+  pred <- predict(model, newdata = newdata, type = "response")
+  
+  # Apply censoring manually to match Tobit assumptions
+  pred[pred < 0] <- 0
+  pred[pred > 1] <- 1
+  
+  return(pred)
+}
+
+# Create sequence of time points for predictions
+time_seq <- seq(min(tobit_data$time_years, na.rm = TRUE), 
+                max(tobit_data$time_years, na.rm = TRUE), 
+                length.out = 100)
+
+# Generate predictions for each group
+# Group A
+pred_data_A <- data.frame(time_years = time_seq)
+pred_data_A$pred_QSEQQALY <- predict_tobit(tobit_A, newdata = pred_data_A)
+pred_data_A$CMQUIT_GROUP_2 <- "A"
+
+# Group B
+pred_data_B <- data.frame(time_years = time_seq)
+pred_data_B$pred_QSEQQALY <- predict_tobit(tobit_B, newdata = pred_data_B)
+pred_data_B$CMQUIT_GROUP_2 <- "B"
+
+# Group C
+pred_data_C <- data.frame(time_years = time_seq)
+pred_data_C$pred_QSEQQALY <- predict_tobit(tobit_C, newdata = pred_data_C)
+pred_data_C$CMQUIT_GROUP_2 <- "C"
+
+# Combine predictions
+tobit_predictions <- rbind(pred_data_A, pred_data_B, pred_data_C)
+```
+Tobit regression results
+```{r}
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
+
+# Tobit regression results
+ggplot() +
+  # raw data points
+  geom_point(data = tobit_data, 
+             aes(x = time_years, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1) +
+  # Tobit regression lines
+  geom_line(data = tobit_predictions, 
+            aes(x = time_years, y = pred_QSEQQALY, color = CMQUIT_GROUP_2), 
+            size = 1) +
+  # Styling
+  scale_color_manual(values = group_colors) +
+  labs(title = "Tobit Regression of Health-Related Quality of Life by Treatment Group", 
+       subtitle = "Accounting for censoring at QALY = 1",
+       x = "Time (years)", 
+       y = "QALY weight") +
+  #scale_y_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0.7, 1)) +
+  theme_classic() +
+  theme(
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "bottom"
+  )
+```
+
+No Tobit models that account for multilevel modeling. (or there were and I could not implement it)
+
+Solution:
+Mixed-effects model for longitudinal data. The new code properly accounts for repeated measures by including random effects for subjects
+
+The code,
+lmm_transformed <- lmer(QSEQQALY_logit ~ time_years * CMQUIT_GROUP_2 + (1 | SUBJNO), data = tobit_data)
+1) acknowledges that observations from the same subject are correlated
+
+we also have a
+2) unified model with interactions
+Instead of separate models, we use a single model with interaction terms, allowing for proper statistical comparison between groups while maintaining more statistical power.
+
+HOWEVER, 
+3) we are "mimicking" Tobit using a two-step approach:
+  a) Logit transformation: QSEQQALY_logit = log(QSEQQALY_bounded/(1-QSEQQALY_bounded))
+  b) Group-specific minimum handling: Using actual observed minimum values per group
+  c) Bounded predictions: Ensuring values stay within [0,1] range
+  
+The method in (3) is different from Tobit, which uses the maximum likelihood estimation to handle values that is close to the limit. Instead, we apply a logit transformation to the data, mapping [0, 1] to [-Inf, Inf] and then mapping it back to [0, 1] once prediction is complete. 
+
+NOTE: Why are there no values between 0.9 and 1.0???
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+
+# Prepare data for analysis - improved NA handling
+tobit_data <- data %>%
+  # Explicitly filter out NA values for QSEQQALY
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365) %>%
+  # Make sure SUBJNO is treated as a factor (for random effects)
+  mutate(SUBJNO = factor(SUBJNO))
+
+# Get minimum values per group (to ensure we're using accurate bounds)
+min_values <- tobit_data %>%
+  group_by(CMQUIT_GROUP_2) %>%
+  summarize(min_QSEQQALY = min(QSEQQALY, na.rm = TRUE))
+
+# Print minimum values to confirm
+print(min_values)
+
+# Now apply transformations with group-specific minimum values
+tobit_data <- tobit_data %>%
+  left_join(min_values, by = "CMQUIT_GROUP_2") %>%
+  # Transform QSEQQALY values to handle censoring
+  # Using a small buffer from actual minimum values
+  mutate(
+    min_buffer = min_QSEQQALY * 0.9, # 90% of min value as buffer
+    QSEQQALY_adj = case_when(
+      QSEQQALY >= 1 ~ 0.999,  # Value close to 1 for right-censored
+      TRUE ~ pmax(QSEQQALY, min_buffer) # Ensure no values below group min
+    ),
+    # Logit transformation to handle bounds
+    QSEQQALY_logit = log(QSEQQALY_adj/(1-QSEQQALY_adj))
+  )
+
+# Fit linear mixed model on transformed data
+lmm_transformed <- lmer(
+  QSEQQALY_logit ~ time_years * CMQUIT_GROUP_2 + (1 | SUBJNO),
+  data = tobit_data,
+  control = lmerControl(optimizer = "bobyqa") # More robust optimizer
+)
+
+# Model summary
+model_summary <- summary(lmm_transformed)
+print(model_summary)
+
+# Create prediction data frame for plotting
+# Use actual observed time range for each group
+time_ranges <- tobit_data %>%
+  group_by(CMQUIT_GROUP_2) %>%
+  summarize(
+    min_time = min(time_years, na.rm = TRUE),
+    max_time = max(time_years, na.rm = TRUE)
+  )
+
+# Create custom prediction grid for all groups with group-specific time ranges
+pred_grid <- do.call(rbind, lapply(unique(tobit_data$CMQUIT_GROUP_2), function(group) {
+  group_range <- time_ranges %>% filter(CMQUIT_GROUP_2 == group)
+  data.frame(
+    time_years = seq(group_range$min_time, group_range$max_time, length.out = 100),
+    CMQUIT_GROUP_2 = group
+  )
+}))
+
+# Add random effect values (set to 0 for population-level predictions)
+pred_grid$SUBJNO <- NA
+
+# Get fixed effects matrix
+X <- model.matrix(~ time_years * CMQUIT_GROUP_2, data = pred_grid)
+
+# Get fixed effects coefficients
+beta <- fixef(lmm_transformed)
+
+# Compute predictions on the logit scale
+pred_grid$predicted_logit <- as.vector(X %*% beta)
+
+# Back-transform to original scale
+pred_grid$predicted_QSEQQALY <- 1 / (1 + exp(-pred_grid$predicted_logit))
+
+# Define group colors to match reference image
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
+
+# Create the plot with improved aesthetics
+ggplot() +
+  # Raw data points
+  geom_point(data = tobit_data, 
+             aes(x = time_years, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1) +
+  # Regression lines
+  geom_line(data = pred_grid, 
+            aes(x = time_years, y = predicted_QSEQQALY, color = CMQUIT_GROUP_2), 
+            size = 1) +
+  # Styling
+  scale_color_manual(values = group_colors) +
+  labs(title = "Tobit Regression of Health-Related Quality of Life by Treatment Group", 
+       subtitle = "Accounting for censoring at QALY = 1",
+       x = "Time (years)", 
+       y = "QALY weight") +
+  scale_y_continuous(limits = c(0.7, 1)) +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+ggplot() +
+  # Raw data points
+  geom_point(data = tobit_data, 
+             aes(x = time_years, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1) +
+  theme_minimal()
+```
+
