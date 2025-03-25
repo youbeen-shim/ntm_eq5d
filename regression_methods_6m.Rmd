@@ -1,0 +1,427 @@
+---
+title: "regression methods"
+author: "Youbeen Shim"
+date: "2025-03-21"
+output: html_document
+---
+
+Primary Question:
+Using 6 Month Follow-up variables, we want to predict CMQUIT_GROUP_2 (which is the treatment response group)
+
+Secondary Question:
+What is the contribution of baseline QSEQQALY in completing our primary goal?
+
+NOTE:
+Too many missing values. Could probably use the original values from "B", but still need to address how to fill in the gap.
+(approx ~13 missing values exist at Baseline as of right now (check regression_methods.Rmd))
+
+
+Multinomial Logistic Regression Model for Predicting Treatment Response in NTM-PD
+
+1. Load libraries and prepare data
+@TODO: Handle NA's
+```{r}
+library(tidyverse)   
+library(nnet)        # For multinomial logistic regression
+library(caret)       # For model evaluation
+library(pROC)        # For ROC curves
+library(sjPlot)      # For visualization of results
+library(car)         # For VIF calculation
+
+# Load the data
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+
+# Filter for baseline data only (time == "B")
+baseline_data <- data %>% 
+  filter(time == "B") %>%
+  # Select relevant variables based on clinical importance
+  select(SUBJNO, CMQUIT_GROUP_2, QSEQQALY, 
+         # Demographic variables
+         AGE, SEX, # DMSMKEVER, 
+         # Medical history variables
+         MHTBTX, MHTNTX, MHCOPD, MHASTH, 
+         # Microbiological variables  
+         MBEDX, # MBDXSPRYN, 
+         # Radiographic variables
+         RFCTFD, RFCTCAVI,
+         # Clinical variables
+         VSBMI, LBWBC, LBALB, LBESR, LBCRP,
+         # Pulmonary function
+         FTPFFEVP, FTPFFVCP, FTPFFEVC, FTPFDLCO,
+         # Disease severity
+         BACES) %>%
+  rename(QSEQQALY_B = QSEQQALY)
+
+updated_eq5d <- data %>%
+  filter(time == "6M") %>%
+  select(SUBJNO, QSEQQALY) %>%
+  rename(QSEQQALY_6M = QSEQQALY)
+
+baseline_data <- left_join(baseline_data, updated_eq5d, by = "SUBJNO") %>%
+  mutate(QSEQQALY = QSEQQALY_6M) # can change do Delta via setting SQSEQQALY = QSEQQALY_6M - QSEQQALY_B
+
+# Check for missing data
+missing_data <- baseline_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "variable", 
+               values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+print(missing_data)
+
+# Factorize categorical variables
+baseline_data <- baseline_data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    # DMSMKEVER = factor(DMSMKEVER),
+    MHTBTX = factor(MHTBTX),
+    MHTNTX = factor(MHTNTX),
+    MHCOPD = factor(MHCOPD),
+    MHASTH = factor(MHASTH),
+    # MBDXSPRYN = factor(MBDXSPRYN),
+    RFCTFD = factor(RFCTFD),
+    RFCTCAVI = factor(RFCTCAVI)
+  ) %>%
+  drop_na() # TODO: Should figure out how to handle NA
+
+
+summary(baseline_data)
+```
+
+2. Baseline model without QSEQQALY
+```{r}
+# Create a baseline model without QSEQQALY 
+baseline_model <- multinom(CMQUIT_GROUP_2 ~ 
+                          AGE + SEX + #DMSMKEVER + 
+                          MHTBTX + MHTNTX + 
+                          #MBDXSPRYN + 
+                          RFCTFD + 
+                          VSBMI + FTPFDLCO + BACES, 
+                        data = baseline_data, 
+                        trace = FALSE)
+
+# Model summary
+summary(baseline_model)
+
+# Examine model fit
+baseline_fit <- fitted(baseline_model)
+
+# Calculate accuracy
+predicted_classes_baseline <- predict(baseline_model, type = "class")
+accuracy_baseline <- mean(predicted_classes_baseline == baseline_data$CMQUIT_GROUP_2, na.rm = TRUE)
+print(paste("Baseline model accuracy:", round(accuracy_baseline * 100, 2), "%"))
+
+# Create confusion matrix
+confmat_baseline <- table(Predicted = predicted_classes_baseline, 
+                        Actual = baseline_data$CMQUIT_GROUP_2)
+print(confmat_baseline)
+
+# Calculate pseudo R-squared
+null_model <- multinom(CMQUIT_GROUP_2 ~ 1, data = baseline_data, trace = FALSE)
+mcfadden_r2_baseline <- 1 - logLik(baseline_model)/logLik(null_model)
+print(paste("McFadden's pseudo R-squared (baseline model):", round(as.numeric(mcfadden_r2_baseline), 4)))
+```
+
+3. QSEQQALY-only model for comparison
+```{r}
+# Create a model with QSEQQALY only
+qseqqaly_only_model <- multinom(CMQUIT_GROUP_2 ~ QSEQQALY, 
+                              data = baseline_data, 
+                              trace = FALSE)
+
+# Calculate McFadden's pseudo R-squared
+mcfadden_r2_qseqqaly <- 1 - logLik(qseqqaly_only_model)/logLik(null_model)
+print(paste("McFadden's pseudo R-squared (QSEQQALY-only model):", round(as.numeric(mcfadden_r2_qseqqaly), 4)))
+
+# Calculate accuracy
+predicted_classes_qseqqaly <- predict(qseqqaly_only_model, type = "class")
+accuracy_qseqqaly <- mean(predicted_classes_qseqqaly == baseline_data$CMQUIT_GROUP_2, na.rm = TRUE)
+print(paste("QSEQQALY-only model accuracy:", round(accuracy_qseqqaly * 100, 2), "%"))
+```
+
+
+4. Full model with QSEQQALY
+```{r}
+# Create full model including QSEQQALY
+full_model <- multinom(CMQUIT_GROUP_2 ~ 
+                       QSEQQALY +
+                       AGE + SEX + #DMSMKEVER + 
+                       MHTBTX + MHTNTX + 
+                       # MBDXSPRYN + 
+                       RFCTFD + 
+                       VSBMI + FTPFDLCO + BACES, 
+                     data = baseline_data, 
+                     trace = FALSE)
+
+# Model summary
+summary(full_model)
+
+# Examine model fit
+full_fit <- fitted(full_model)
+
+# Calculate accuracy
+predicted_classes_full <- predict(full_model, type = "class")
+accuracy_full <- mean(predicted_classes_full == baseline_data$CMQUIT_GROUP_2, na.rm = TRUE)
+print(paste("Full model accuracy:", round(accuracy_full * 100, 2), "%"))
+
+# Create confusion matrix
+confmat_full <- table(Predicted = predicted_classes_full, 
+                     Actual = baseline_data$CMQUIT_GROUP_2)
+print(confmat_full)
+
+# Calculate McFadden's pseudo R-squared
+mcfadden_r2_full <- 1 - logLik(full_model)/logLik(null_model)
+print(paste("McFadden's pseudo R-squared (full model):", round(as.numeric(mcfadden_r2_full), 4)))
+
+# Calculate the contribution of QSEQQALY
+r2_difference <- as.numeric(mcfadden_r2_full) - as.numeric(mcfadden_r2_baseline)
+print(paste("QSEQQALY contribution to McFadden's R-squared:", round(r2_difference, 4)))
+print(paste("Percent improvement:", round(r2_difference/as.numeric(mcfadden_r2_baseline) * 100, 2), "%"))
+
+# Likelihood ratio test to compare models
+lr_test <- anova(baseline_model, full_model)
+print(lr_test)
+```
+
+5. (Extra; currently broken) Cross-validation to evaluate robustness
+```{r}
+# Set up cross-validation
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = multiClassSummary
+)
+
+# Convert variables to numeric for caret
+model_data <- baseline_data %>%
+  mutate_if(is.factor, as.numeric)
+
+# Train model with baseline variables only
+cv_model_baseline <- train(
+  #CMQUIT_GROUP_2 ~ AGE + SEX + DMSMKEVER + MHTBTX + MHTNTX + MBDXSPRYN + RFCTFD + VSBMI + FTPFDLCO + BACES,
+  CMQUIT_GROUP_2 ~ AGE + SEX + MHTBTX + MHTNTX + RFCTFD + VSBMI + FTPFDLCO + BACES,
+  data = model_data,
+  method = "cforest",
+  trControl = train_control,
+  trace = FALSE
+)
+
+# Train model with QSEQQALY included
+cv_model_full <- train(
+  #CMQUIT_GROUP_2 ~ QSEQQALY + AGE + SEX + DMSMKEVER + MHTBTX + MHTNTX + MBDXSPRYN + RFCTFD + VSBMI + FTPFDLCO + BACES,
+  CMQUIT_GROUP_2 ~ QSEQQALY + AGE + SEX + MHTBTX + MHTNTX + RFCTFD + VSBMI + FTPFDLCO + BACES,
+  data = model_data,
+  method = "cforest",
+  trControl = train_control,
+  trace = FALSE
+)
+
+# Compare results
+print("Cross-validation results for baseline model:")
+print(cv_model_baseline)
+print(cv_model_baseline$results)
+
+print("Cross-validation results for full model (with QSEQQALY):")
+print(cv_model_full)
+print(cv_model_full$results)
+
+# Calculate improvement in cross-validated accuracy
+cv_improvement <- cv_model_full$results$Accuracy - cv_model_baseline$results$Accuracy
+print(paste("Cross-validated accuracy improvement with QSEQQALY:", round(cv_improvement, 4)))
+```
+
+6. Variable importance and visualization
+```{r}
+# Calculate odds ratios for the full model
+odds_ratios <- exp(coef(full_model))
+print("Odds ratios for full model:")
+print(odds_ratios)
+
+# Calculate variable importance by comparing full model to models with each variable removed
+calculate_importance <- function(full_model, data) {
+  # Get all predictors
+  predictors <- attr(terms(full_model), "term.labels")
+  
+  # Initialize results dataframe
+  importance_df <- data.frame(
+    variable = character(),
+    log_likelihood = numeric(),
+    chi_square = numeric(),
+    p_value = numeric(),
+    importance = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Full model log-likelihood
+  full_ll <- logLik(full_model)
+  
+  # Loop through each predictor
+  for (pred in predictors) {
+    # Create formula without this predictor
+    reduced_formula <- as.formula(
+      paste("CMQUIT_GROUP_2 ~", 
+            paste(predictors[predictors != pred], collapse = " + "))
+    )
+    
+    # Fit reduced model
+    reduced_model <- multinom(reduced_formula, data = data, trace = FALSE)
+    reduced_ll <- logLik(reduced_model)
+    
+    # Calculate chi-square
+    chi_sq <- -2 * (reduced_ll - full_ll)
+    df <- attr(full_ll, "df") - attr(reduced_ll, "df")
+    p_val <- pchisq(chi_sq, df = df, lower.tail = FALSE)
+    
+    # Calculate normalized importance
+    importance <- as.numeric(chi_sq / df)
+    
+    # Add to results
+    importance_df <- rbind(importance_df, data.frame(
+      variable = pred,
+      log_likelihood = as.numeric(reduced_ll),
+      chi_square = as.numeric(chi_sq),
+      p_value = p_val,
+      importance = importance
+    ))
+  }
+  
+  # Sort by importance
+  importance_df <- importance_df %>%
+    arrange(desc(importance))
+  
+  return(importance_df)
+}
+
+# Calculate variable importance
+var_importance <- calculate_importance(full_model, baseline_data)
+print(var_importance)
+```
+
+7. Plot predicted probabilities against QSEQQALY
+```{r}
+# Create a grid of QSEQQALY values
+qseqqaly_range <- seq(min(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      max(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      length.out = 100)
+
+# Create a dataframe with the mean/median of other predictors
+new_data <- expand.grid(
+  QSEQQALY = qseqqaly_range,
+  AGE = median(baseline_data$AGE, na.rm = TRUE),
+  SEX = levels(baseline_data$SEX)[1],
+  # DMSMKEVER = levels(baseline_data$DMSMKEVER)[1],
+  MHTBTX = levels(baseline_data$MHTBTX)[1],
+  MHTNTX = levels(baseline_data$MHTNTX)[1],
+  # MBDXSPRYN = levels(baseline_data$MBDXSPRYN)[1],
+  RFCTFD = levels(baseline_data$RFCTFD)[1],
+  VSBMI = median(baseline_data$VSBMI, na.rm = TRUE),
+  FTPFDLCO = median(baseline_data$FTPFDLCO, na.rm = TRUE),
+  BACES = median(baseline_data$BACES, na.rm = TRUE)
+)
+
+# Get predicted probabilities
+predicted_probs <- predict(full_model, newdata = new_data, type = "probs")
+predicted_data <- cbind(new_data, predicted_probs)
+
+# Convert to long format for plotting
+predicted_data_long <- predicted_data %>%
+  pivot_longer(cols = c(A, B, C), 
+               names_to = "CMQUIT_GROUP_2", 
+               values_to = "probability")
+
+# Plot
+ggplot(predicted_data_long, aes(x = QSEQQALY, y = probability, color = CMQUIT_GROUP_2)) +
+  geom_line(size = 1.2) +
+  labs(title = "Predicted Probabilities by QSEQQALY Score",
+       x = "QSEQQALY Score at 6-Month Followup",
+       y = "Predicted Probability",
+       color = "Treatment Response Group") +
+  scale_color_manual(values = c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA"),
+                     labels = c("A" = "Culture Conversion & Completed",
+                               "B" = "Failed Culture Conversion",
+                               "C" = "Discontinued (Adverse Events)")) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+8. Final model and summary
+```{r}
+# Create a more parsimonious final model based on important variables
+# (Include top variables identified from importance analysis)
+final_model <- multinom(CMQUIT_GROUP_2 ~ 
+                        QSEQQALY + FTPFDLCO + RFCTFD + MHTNTX + AGE,
+                      data = baseline_data, 
+                      trace = FALSE)
+
+# Calculate accuracy
+predicted_classes_final <- predict(final_model, type = "class")
+accuracy_final <- mean(predicted_classes_final == baseline_data$CMQUIT_GROUP_2, na.rm = TRUE)
+print(paste("Final model accuracy:", round(accuracy_final * 100, 2), "%"))
+
+# Calculate McFadden's pseudo R-squared
+mcfadden_r2_final <- 1 - logLik(final_model)/logLik(null_model)
+print(paste("McFadden's pseudo R-squared (final model):", round(as.numeric(mcfadden_r2_final), 4)))
+
+# Create a summary table of all models
+model_summary <- data.frame(
+  Model = c("Baseline (without QSEQQALY)", 
+            "Full (with QSEQQALY)", 
+            "QSEQQALY only",
+            "Final parsimonious model"),
+  Accuracy = c(accuracy_baseline, 
+               accuracy_full, 
+               accuracy_qseqqaly,
+               accuracy_final) * 100,
+  McFadden_R2 = c(as.numeric(mcfadden_r2_baseline),
+                 as.numeric(mcfadden_r2_full),
+                 as.numeric(mcfadden_r2_qseqqaly),
+                 as.numeric(mcfadden_r2_final)),
+  Improvement = c(NA,
+                 (as.numeric(mcfadden_r2_full) - as.numeric(mcfadden_r2_baseline))/as.numeric(mcfadden_r2_baseline) * 100,
+                 NA,
+                 (as.numeric(mcfadden_r2_final) - as.numeric(mcfadden_r2_baseline))/as.numeric(mcfadden_r2_baseline) * 100)
+)
+
+# Format the table
+model_summary$Accuracy <- round(model_summary$Accuracy, 2)
+model_summary$McFadden_R2 <- round(model_summary$McFadden_R2, 4)
+model_summary$Improvement <- round(model_summary$Improvement, 2)
+model_summary$Improvement[c(1,3)] <- NA
+
+print(model_summary)
+```
+
+9. Conclusions about QSEQQALY contribution
+```{r}
+# Calculate the relative contribution of QSEQQALY to the predictive power
+qseqqaly_contribution <- as.numeric(mcfadden_r2_qseqqaly) / as.numeric(mcfadden_r2_full) * 100
+qseqqaly_improvement <- (as.numeric(mcfadden_r2_full) - as.numeric(mcfadden_r2_baseline)) / as.numeric(mcfadden_r2_baseline) * 100
+
+# Create a summary specifically about QSEQQALY
+qseqqaly_summary <- data.frame(
+  Metric = c("QSEQQALY-only model R²",
+             "Full model R²",
+             "Baseline model R²",
+             "QSEQQALY absolute contribution to R²",
+             "QSEQQALY relative contribution to full model (%)",
+             "Improvement in R² due to QSEQQALY (%)",
+             "QSEQQALY variable importance rank",
+             "QSEQQALY p-value"),
+  Value = c(round(as.numeric(mcfadden_r2_qseqqaly), 4),
+            round(as.numeric(mcfadden_r2_full), 4),
+            round(as.numeric(mcfadden_r2_baseline), 4),
+            round(as.numeric(mcfadden_r2_full) - as.numeric(mcfadden_r2_baseline), 4),
+            round(qseqqaly_contribution, 2),
+            round(qseqqaly_improvement, 2),
+            which(var_importance$variable == "QSEQQALY"),
+            round(var_importance$p_value[var_importance$variable == "QSEQQALY"], 4))
+)
+
+print(qseqqaly_summary)
+```
+
