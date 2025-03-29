@@ -352,7 +352,7 @@ predicted_data_long <- predicted_data %>%
 # Plot
 pred_prob <- ggplot(predicted_data_long, aes(x = QSEQQALY_6M, y = probability, color = CMQUIT_GROUP_2)) +
   geom_line(size = 1.2) +
-  labs(title = "Predicted Probabilities by QALY Delta",
+  labs(title = "Predicted Probabilities by QALY 6M & Delta ",
        x = "QALY, at 6 Month Follow-up",
        y = "Predicted Probability",
        color = "Treatment Response Group") +

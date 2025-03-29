@@ -43,17 +43,22 @@ baseline_data <- data %>%
          # Demographic variables
          AGE, SEX, # DMSMKEVER, 
          # Medical history variables
-         MHTBTX, MHTNTX, MHCOPD, MHASTH, 
+         MHTBTX, MHTNTX, MHCOPD, MHASTH, # unnecessary 
          # Microbiological variables  
-         MBEDX, # MBDXSPRYN, 
+         MBEDX, # MBDXSPRYN, # unnecessary 
          # Radiographic variables
-         RFCTFD, RFCTCAVI,
+         # RFCTFD, # unnecessary 
+         RFCTCAVI,
          # Clinical variables
-         VSBMI, LBWBC, LBALB, LBESR, LBCRP,
+         VSBMI, 
+         LBWBC, # unnecessary 
+         LBALB, # duplicate with BMI
+         LBESR, 
+         LBCRP, # duplicate with ESR
          # Pulmonary function
-         FTPFFEVP, FTPFFVCP, FTPFFEVC, FTPFDLCO,
+         FTPFFEVP, FTPFFVCP, FTPFFEVC, FTPFDLCO, # unnecessary 
          # Disease severity
-         BACES)
+         BACES) # BACES includes age/bmi/cavi/esr - with and without 
 
 # Check for missing data
 missing_data <- baseline_data %>%
@@ -85,6 +90,21 @@ baseline_data <- baseline_data %>%
 
 summary(baseline_data)
 ```
+
+```{r}
+# Age, Sex, BMI 
+
+b_data <- data %>% filter(time == 'B')
+hist(b_data$AGE)
+
+table(b_data$SEX)
+table(b_data$SEX, b_data$CMQUIT_GROUP_2)
+
+hist(b_data$VSBMI)
+
+hist(b_data$BACES) # 0&1, 2&3, 4&5 
+```
+
 
 2. Baseline model without QSEQQALY
 ```{r}

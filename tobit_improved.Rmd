@@ -313,7 +313,7 @@ group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
 ggplot() +
   # Raw data points
   geom_point(data = tobit_data, 
-             aes(x = time_years, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             aes(x = time_years, y = QSEQQALY, color = ›), 
              alpha = 0.3, size = 1) +
   # Regression lines
   geom_line(data = pred_grid, 
