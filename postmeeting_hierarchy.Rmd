@@ -1,0 +1,1476 @@
+---
+title: "regression methods"
+author: "Youbeen Shim"
+date: "2025-03-21"
+output: html_document
+---
+
+Summary:
+
+- Currently, I have simplified the model into the most important features without losing ROC.
+- I have also simplified the objective into predicting Group C - i.e. Treatment Discontinuation
+- Tobit model was also considered cross-sectionally, but this was difficult due to the circular nature 
+of tobit modeling followed by logistic regression using the same variables 
+
+- The goal of this section is to explore and establish the validity of adopting a hierarchical model
+- There will be 4 (possible) levels:
+  - age
+  - sex
+  - cavity
+  - smoking
+
+First, set up.
+```{r}
+library(tidyverse)   
+library(nnet)        # For multinomial logistic regression
+library(caret)       # For model evaluation
+library(pROC)        # For ROC curves
+library(sjPlot)      # For visualization of results
+library(car)         # For VIF calculation
+
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+
+# Filter for baseline data only (time == "B")
+baseline_data <- data %>% 
+  filter(time == "B") %>%
+  select(SUBJNO, 
+         CMQUIT_GROUP_2, 
+         QSEQQALY, 
+         AGE, 
+         SEX,
+         DMSMK, # 0 = never ; 1 = former ; (2 = current, but no observed current smokers in this study)
+         RFCTCAVI,
+         VSBMI, 
+         LBESR, 
+         BACES) # BACES is a function of age/bmi/cavi/esr/sex
+
+## To add QALY_delta
+# updated_eq5d <- data %>%
+#   filter(time == "6M") %>%
+#   select(SUBJNO, QSEQQALY) %>%
+#   rename(QSEQQALY_6M = QSEQQALY)
+# 
+# baseline_data <- left_join(baseline_data, updated_eq5d, by = "SUBJNO") %>%
+#   mutate(QSEQQALY_delta = QSEQQALY_6M - QSEQQALY)
+
+# Create the binary outcome variable: "Continue" (A or B) vs. "Discontinue" (C)
+baseline_data <- baseline_data %>%
+  mutate(treatment_status = case_when(
+    CMQUIT_GROUP_2 %in% c("A", "B") ~ "Continue",
+    CMQUIT_GROUP_2 == "C" ~ "Discontinue",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(treatment_status = factor(treatment_status, levels = c("Continue", "Discontinue")))
+
+# Check for missing data
+missing_data <- baseline_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "variable", 
+               values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+print(missing_data)
+
+# Factorize categorical variables
+baseline_data <- baseline_data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    DMSMK = factor(DMSMK),
+    RFCTCAVI = factor(RFCTCAVI)
+  ) %>%
+  drop_na() 
+
+summary(baseline_data)
+
+full_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data, 
+                  family = binomial())
+
+# Model summary
+summary(full_model)
+
+# predictions
+predicted_probs_full <- predict(full_model, type = "response")
+predicted_class_full <- ifelse(predicted_probs_full > 0.2, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full <- table(Predicted = predicted_class_full, 
+                    Actual = baseline_data$treatment_status)
+print(confmat_full)
+```
+
+Actually, it might be worth checking out the performance of the model when individuals with a QALY of 1 
+is EXCLUDED (from both Continued and Discontinued groups)
+```{r}
+skimmed_data <- baseline_data %>%
+  filter(QSEQQALY < 0.999)
+
+table(skimmed_data$treatment_status)
+
+skimmed_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = skimmed_data, 
+                  family = binomial())
+
+# Model summary
+summary(skimmed_model)
+
+# predictions
+predicted_probs_full <- predict(skimmed_model, type = "response")
+predicted_class_full <- ifelse(predicted_probs_full > 0.5, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full <- table(Predicted = predicted_class_full, 
+                      Actual = skimmed_data$treatment_status)
+print(confmat_full)
+
+roc(skimmed_data$treatment_status, predicted_probs_full)
+```
+
+
+Then, it is important to consider the data structure.
+
+My primary concern right now is the fact that the modeling results so far gained high levels of 
+accuracy & ROC by largely predicting that the patient will NOT discontinue the treatment. 
+
+Easy example of this is when there is only 1 out of 100 patients who are sick, a model that predicts 
+that no patients are sick will result in 99% accuracy. This is also in effect a useless model. 
+
+My best model has the below performance: 
+             Actual
+Predicted     Continue Discontinue
+  Continue         130          44
+  Discontinue        4           2
+  
+So, of the 134 patients who continue, 130 are (accurately) predicted to do so, and 4 are not
+And, of the 46 who DIScontinue, only 2 are (accurately) predicted to do so, with 44 predicted to continue.
+
+The natural first question, then, is whether or not the hierarchy has somewhat of a stratified pattern on
+treatment discontinuation. 
+```{r}
+# Building on the existing binomial logistic regression model
+# Implementing Permutation Decision Trees (PDT) to explore hierarchical structure
+
+library(tidyverse)   
+library(nnet)        # For multinomial logistic regression
+library(caret)       # For model evaluation
+library(pROC)        # For ROC curves
+library(sjPlot)      # For visualization of results
+library(car)         # For VIF calculation
+library(rpart)       # For decision trees
+library(rpart.plot)  # For plotting decision trees
+library(partykit)    # For conditional inference trees
+library(randomForest) # For variable importance
+library(pdp)         # For partial dependence plots
+
+# Load and prepare data (assuming the same preprocessing as in the original code)
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+baseline_data <- data %>% 
+  filter(time == "B") %>%
+  select(SUBJNO, 
+         CMQUIT_GROUP_2, 
+         QSEQQALY, 
+         AGE, 
+         SEX,
+         DMSMK,
+         RFCTCAVI,
+         VSBMI, 
+         LBESR, 
+         BACES)
+
+baseline_data <- baseline_data %>%
+  mutate(treatment_status = case_when(
+    CMQUIT_GROUP_2 %in% c("A", "B") ~ "Continue",
+    CMQUIT_GROUP_2 == "C" ~ "Discontinue",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(treatment_status = factor(treatment_status, levels = c("Continue", "Discontinue")))
+
+# Factorize categorical variables
+baseline_data <- baseline_data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    DMSMK = factor(DMSMK),
+    RFCTCAVI = factor(RFCTCAVI)
+  ) %>%
+  drop_na() 
+
+# Original logistic regression model for reference
+full_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data, 
+                  family = binomial())
+
+#------------------------------------------------------------------------------
+# Permutation Decision Trees (PDT) Implementation
+#------------------------------------------------------------------------------
+
+# Function to perform permutation importance for decision trees
+pdt_importance <- function(data, target_var, predictor_vars, n_permutations = 100, 
+                           tree_method = "rpart", seed = 123) {
+  
+  set.seed(seed)
+  
+  # Create formula
+  formula_str <- paste(target_var, "~", paste(predictor_vars, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  # Fit the original tree
+  if (tree_method == "rpart") {
+    orig_tree <- rpart(formula_obj, data = data, method = "class", 
+                       control = rpart.control(cp = 0.01))
+    orig_acc <- sum(predict(orig_tree, type = "class") == data[[target_var]]) / nrow(data)
+  } else if (tree_method == "ctree") {
+    orig_tree <- ctree(formula_obj, data = data)
+    orig_acc <- sum(predict(orig_tree) == data[[target_var]]) / nrow(data)
+  } else {
+    stop("Unsupported tree method")
+  }
+  
+  # Initialize importance dataframe
+  importance_df <- data.frame(variable = predictor_vars, 
+                              mean_importance = 0, 
+                              sd_importance = 0)
+  
+  # For each predictor variable
+  for (i in seq_along(predictor_vars)) {
+    var_name <- predictor_vars[i]
+    importance_values <- numeric(n_permutations)
+    
+    # Perform permutations
+    for (j in 1:n_permutations) {
+      # Create a permuted dataset
+      permuted_data <- data
+      permuted_data[[var_name]] <- sample(data[[var_name]])
+      
+      # Fit tree on permuted data
+      if (tree_method == "rpart") {
+        perm_tree <- rpart(formula_obj, data = permuted_data, method = "class", 
+                         control = rpart.control(cp = 0.01))
+        perm_acc <- sum(predict(perm_tree, type = "class") == data[[target_var]]) / nrow(data)
+      } else if (tree_method == "ctree") {
+        perm_tree <- ctree(formula_obj, data = permuted_data)
+        perm_acc <- sum(predict(perm_tree) == data[[target_var]]) / nrow(data)
+      }
+      
+      # Calculate importance (decrease in accuracy)
+      importance_values[j] <- orig_acc - perm_acc
+    }
+    
+    # Store mean and sd of importance values
+    importance_df$mean_importance[i] <- mean(importance_values)
+    importance_df$sd_importance[i] <- sd(importance_values)
+  }
+  
+  # Return results
+  return(list(
+    importance = importance_df,
+    original_accuracy = orig_acc,
+    original_tree = orig_tree
+  ))
+}
+
+# Function to explore hierarchical structure through conditional trees
+explore_hierarchical_structure <- function(data, target_var, vars_to_explore) {
+  result_list <- list()
+  
+  # Step 1: Build a tree with all variables
+  formula_all <- as.formula(paste(target_var, "~", paste(vars_to_explore, collapse = " + ")))
+  tree_all <- ctree(formula_all, data = data)
+  result_list$full_tree <- tree_all
+  
+  # Step 2: For each variable of interest, stratify the data and build conditional trees
+  for (var in vars_to_explore) {
+    # Create a list to store trees for each level of the variable
+    var_trees <- list()
+    
+    # For each level of the variable
+    for (level in unique(data[[var]])) {
+      # Subset data for this level
+      subset_data <- data[data[[var]] == level, ]
+      
+      # Only proceed if we have enough data
+      if (nrow(subset_data) >= 20) {
+        # Create formula excluding the current variable
+        other_vars <- vars_to_explore[vars_to_explore != var]
+        formula_str <- paste(target_var, "~", paste(other_vars, collapse = " + "))
+        formula_obj <- as.formula(formula_str)
+        
+        # Fit conditional inference tree
+        tree <- ctree(formula_obj, data = subset_data)
+        
+        # Store in the list
+        var_trees[[as.character(level)]] <- list(
+          tree = tree,
+          n = nrow(subset_data)
+        )
+      }
+    }
+    
+    # Add to results
+    result_list[[var]] <- var_trees
+  }
+  
+  return(result_list)
+}
+
+# Function to analyze differences in variable importance across strata
+analyze_importance_differences <- function(data, target_var, predictor_vars, 
+                                           stratification_vars, n_permutations = 50) {
+  results <- list()
+  
+  # For each stratification variable
+  for (strat_var in stratification_vars) {
+    var_results <- list()
+    
+    # For each level of the stratification variable
+    for (level in unique(data[[strat_var]])) {
+      # Subset data
+      subset_data <- data[data[[strat_var]] == level, ]
+      
+      # Skip if insufficient data
+      if (nrow(subset_data) < 20) {
+        var_results[[as.character(level)]] <- NULL
+        next
+      }
+      
+      # Variables to use (exclude the stratification variable itself)
+      vars_to_use <- predictor_vars[predictor_vars != strat_var]
+      
+      # Calculate permutation importance
+      pdt_result <- pdt_importance(subset_data, target_var, vars_to_use, 
+                                 n_permutations = n_permutations, 
+                                 tree_method = "ctree")
+      
+      # Store results
+      var_results[[as.character(level)]] <- list(
+        importance = pdt_result$importance,
+        accuracy = pdt_result$original_accuracy,
+        n = nrow(subset_data)
+      )
+    }
+    
+    # Calculate differences in variable importance across strata
+    if (length(var_results) > 1) {
+      levels <- names(var_results)
+      importance_diff <- list()
+      
+      for (i in 1:(length(levels)-1)) {
+        for (j in (i+1):length(levels)) {
+          if (is.null(var_results[[levels[i]]]) || is.null(var_results[[levels[j]]])) {
+            next
+          }
+          
+          # Get importance dataframes
+          imp_i <- var_results[[levels[i]]]$importance
+          imp_j <- var_results[[levels[j]]]$importance
+          
+          # Calculate differences
+          diff_df <- merge(imp_i, imp_j, by = "variable", suffixes = c("_1", "_2"))
+          diff_df$diff <- diff_df$mean_importance_1 - diff_df$mean_importance_2
+          
+          # Standardize difference by pooled standard deviation
+          diff_df$pooled_sd <- sqrt((diff_df$sd_importance_1^2 + diff_df$sd_importance_2^2) / 2)
+          diff_df$std_diff <- diff_df$diff / diff_df$pooled_sd
+          
+          # Store result
+          key <- paste(levels[i], "vs", levels[j])
+          importance_diff[[key]] <- diff_df
+        }
+      }
+      
+      var_results$importance_differences <- importance_diff
+    }
+    
+    # Add to results
+    results[[strat_var]] <- var_results
+  }
+  
+  return(results)
+}
+
+# Apply the PDT methodology to our data
+predictor_vars <- c("QSEQQALY", "AGE", "SEX", "DMSMK", "RFCTCAVI", "VSBMI", "LBESR")
+target_var <- "treatment_status"
+
+# 1. Overall variable importance
+overall_importance <- pdt_importance(baseline_data, target_var, predictor_vars, 
+                                   n_permutations = 100, tree_method = "ctree")
+
+# 2. Explore hierarchical structure with variables of interest
+hierarchy_vars <- c("AGE", "SEX", "DMSMK", "RFCTCAVI")
+hierarchical_structure <- explore_hierarchical_structure(baseline_data, target_var, predictor_vars)
+
+# 3. Analyze differences in variable importance across strata
+importance_differences <- analyze_importance_differences(baseline_data, target_var, predictor_vars, 
+                                                       stratification_vars = hierarchy_vars, 
+                                                       n_permutations = 50)
+
+# Print overall importance
+print("Overall Variable Importance:")
+print(overall_importance$importance[order(-overall_importance$importance$mean_importance), ])
+
+# Plot overall importance
+ggplot(overall_importance$importance, aes(x = reorder(variable, mean_importance), y = mean_importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_errorbar(aes(ymin = mean_importance - sd_importance, 
+                    ymax = mean_importance + sd_importance), width = 0.2) +
+  coord_flip() +
+  labs(x = "Variable", y = "Importance (Decrease in Accuracy)", 
+       title = "Permutation Variable Importance") +
+  theme_bw()
+
+# Plot the overall tree
+plot(hierarchical_structure$full_tree)
+
+# For each stratification variable of interest, examine the differences in importance
+for (var in hierarchy_vars) {
+  cat("\n\n====================================\n")
+  cat(paste("Examining stratification by:", var, "\n"))
+  cat("====================================\n")
+  
+  strat_results <- importance_differences[[var]]
+  
+  # Print results for each level
+  for (level in names(strat_results)) {
+    if (level == "importance_differences") next
+    if (is.null(strat_results[[level]])) next
+    
+    cat(paste("\nLevel:", level, "  N =", strat_results[[level]]$n, "\n"))
+    cat("Variable Importance:\n")
+    print(strat_results[[level]]$importance[order(-strat_results[[level]]$importance$mean_importance), ])
+  }
+  
+  # Print differences between levels
+  if (!is.null(strat_results$importance_differences)) {
+    cat("\nDifferences in Variable Importance between Levels:\n")
+    for (diff_key in names(strat_results$importance_differences)) {
+      cat(paste("\n", diff_key, ":\n"))
+      diff_df <- strat_results$importance_differences[[diff_key]]
+      diff_df <- diff_df[order(-abs(diff_df$std_diff)), c("variable", "diff", "std_diff")]
+      print(diff_df)
+    }
+  }
+  
+  # Plot the tree for each level
+  for (level in names(strat_results)) {
+    if (level == "importance_differences") next
+    if (is.null(strat_results[[level]])) next
+    
+    # Get the corresponding tree from hierarchical_structure
+    level_tree <- hierarchical_structure[[var]][[level]]$tree
+    if (!is.null(level_tree)) {
+      cat(paste("\nDecision Tree for", var, "=", level, ":\n"))
+      # We would plot here in an interactive environment
+    }
+  }
+}
+
+# Visualize the importance differences
+for (var in hierarchy_vars) {
+  strat_results <- importance_differences[[var]]
+  
+  # Skip if no importance differences
+  if (is.null(strat_results$importance_differences)) next
+  
+  # For each comparison
+  for (diff_key in names(strat_results$importance_differences)) {
+    diff_df <- strat_results$importance_differences[[diff_key]]
+    
+    # Create plot
+    p <- ggplot(diff_df, aes(x = reorder(variable, std_diff), y = std_diff)) +
+      geom_bar(stat = "identity", aes(fill = std_diff > 0)) +
+      coord_flip() +
+      labs(x = "Variable", y = "Standardized Difference in Importance", 
+           title = paste("Importance Differences:", diff_key),
+           subtitle = paste("Stratified by", var)) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      scale_fill_manual(values = c("firebrick", "steelblue"))
+    
+    print(p)
+  }
+}
+
+# Additional analysis: Compare model performance stratified by the potential hierarchical variables
+model_comparison <- data.frame(Stratification = character(),
+                              Level = character(),
+                              AUC = numeric(),
+                              Accuracy = numeric(),
+                              N = integer(),
+                              stringsAsFactors = FALSE)
+
+for (var in hierarchy_vars) {
+  # For each level of the variable
+  for (level in unique(baseline_data[[var]])) {
+    # Subset data
+    subset_data <- baseline_data[baseline_data[[var]] == level, ]
+    
+    # Skip if insufficient data
+    if (nrow(subset_data) < 20 || length(unique(subset_data$treatment_status)) < 2) {
+      next
+    }
+    
+    # Fit logistic regression model
+    formula_str <- paste("treatment_status ~", paste(predictor_vars[predictor_vars != var], collapse = " + "))
+    model <- glm(as.formula(formula_str), data = subset_data, family = binomial())
+    
+    # Calculate predictions
+    pred_probs <- predict(model, type = "response")
+    pred_class <- ifelse(pred_probs > 0.5, "Discontinue", "Continue")
+    
+    # Calculate performance metrics
+    auc_value <- tryCatch({
+      roc_obj <- roc(subset_data$treatment_status, pred_probs)
+      auc(roc_obj)
+    }, error = function(e) NA)
+    
+    accuracy <- sum(pred_class == subset_data$treatment_status) / nrow(subset_data)
+    
+    # Add to dataframe
+    model_comparison <- rbind(model_comparison, data.frame(
+      Stratification = var,
+      Level = as.character(level),
+      AUC = auc_value,
+      Accuracy = accuracy,
+      N = nrow(subset_data)
+    ))
+  }
+}
+
+# Print model comparison
+print("Model Performance Stratified by Potential Hierarchical Variables:")
+print(model_comparison)
+
+# Visualize model performance differences
+ggplot(model_comparison, aes(x = Stratification, y = AUC, fill = Level)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "AUC by Stratification Variable and Level",
+       y = "AUC", x = "Stratification Variable") +
+  theme_bw() +
+  geom_text(aes(label = paste0("n=", N)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3)
+
+#------------------------------------------------------------------------------
+# Extension: Forest-based approach for hierarchical structure detection
+#------------------------------------------------------------------------------
+
+# Function to detect interactions using random forest
+detect_interactions_rf <- function(data, target_var, predictor_vars, n_trees = 500) {
+  # Create formula
+  formula_str <- paste(target_var, "~", paste(predictor_vars, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  # Fit random forest
+  rf_model <- randomForest(formula_obj, data = data, ntree = n_trees, 
+                          importance = TRUE)
+  
+  # Get variable importance
+  var_imp <- importance(rf_model)
+  var_imp_df <- data.frame(
+    variable = rownames(var_imp),
+    mean_decrease_accuracy = var_imp[, "MeanDecreaseAccuracy"],
+    mean_decrease_gini = var_imp[, "MeanDecreaseGini"]
+  )
+  
+  # Detect potential interactions using partial dependence plots
+  interactions <- list()
+  
+  # Get top 5 most important variables by mean decrease in accuracy
+  top_vars <- var_imp_df$variable[order(-var_imp_df$mean_decrease_accuracy)][1:min(5, length(predictor_vars))]
+  
+  # For each pair of top variables
+  for (i in 1:(length(top_vars)-1)) {
+    for (j in (i+1):length(top_vars)) {
+      var1 <- top_vars[i]
+      var2 <- top_vars[j]
+      
+      # Calculate partial dependence for the interaction
+      pdp_interaction <- try({
+        interact.plot(rf_model, data = data, 
+                      pred.var = c(var1, var2),
+                      plot = FALSE)
+      }, silent = TRUE)
+      
+      if (!inherits(pdp_interaction, "try-error")) {
+        # Store interaction result
+        interactions[[paste(var1, "x", var2)]] <- pdp_interaction
+      }
+    }
+  }
+  
+  return(list(
+    rf_model = rf_model,
+    importance = var_imp_df,
+    interactions = interactions
+  ))
+}
+
+# Apply random forest interaction detection
+rf_interactions <- detect_interactions_rf(baseline_data, target_var, predictor_vars)
+
+# Print variable importance from random forest
+print("Random Forest Variable Importance:")
+print(rf_interactions$importance[order(-rf_interactions$importance$mean_decrease_accuracy), ])
+
+# Plot random forest variable importance
+ggplot(rf_interactions$importance, 
+       aes(x = reorder(variable, mean_decrease_accuracy), y = mean_decrease_accuracy)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(x = "Variable", y = "Mean Decrease in Accuracy", 
+       title = "Random Forest Variable Importance") +
+  theme_bw()
+
+# Print detected interactions
+cat("\nPotential Variable Interactions Detected:\n")
+for (interaction_name in names(rf_interactions$interactions)) {
+  cat(paste("- ", interaction_name, "\n"))
+}
+
+#------------------------------------------------------------------------------
+# Final hierarchical interpretation
+#------------------------------------------------------------------------------
+
+# Function to create a hierarchical interpretation summary
+summarize_hierarchy <- function(importance_differences, rf_interactions, threshold = 0.5) {
+  
+  # Start with an empty result
+  hierarchy_summary <- list()
+  
+  # For each stratification variable
+  for (var in names(importance_differences)) {
+    strat_results <- importance_differences[[var]]
+    
+    # Skip if no importance differences
+    if (is.null(strat_results$importance_differences)) {
+      hierarchy_summary[[var]] <- "No significant hierarchical structure detected"
+      next
+    }
+    
+    # Initialize list to store findings
+    findings <- list()
+    
+    # For each comparison
+    for (diff_key in names(strat_results$importance_differences)) {
+      diff_df <- strat_results$importance_differences[[diff_key]]
+      
+      # Find variables with large standardized differences
+      significant_diffs <- diff_df[abs(diff_df$std_diff) > threshold, ]
+      
+      if (nrow(significant_diffs) > 0) {
+        significant_diffs <- significant_diffs[order(-abs(significant_diffs$std_diff)), ]
+        findings[[diff_key]] <- significant_diffs
+      }
+    }
+    
+    # Add to summary
+    hierarchy_summary[[var]] <- findings
+  }
+  
+  # Add random forest interactions
+  hierarchy_summary$rf_interactions <- names(rf_interactions$interactions)
+  
+  return(hierarchy_summary)
+}
+
+# Generate final hierarchy summary
+hierarchy_summary <- summarize_hierarchy(importance_differences, rf_interactions, threshold = 0.8)
+
+# Print summary
+cat("\n\n==============================================\n")
+cat("FINAL HIERARCHICAL STRUCTURE INTERPRETATION\n")
+cat("==============================================\n\n")
+
+for (var in names(hierarchy_summary)) {
+  if (var == "rf_interactions") {
+    cat("\nRandom Forest Detected Interactions:\n")
+    if (length(hierarchy_summary[[var]]) > 0) {
+      for (interaction in hierarchy_summary[[var]]) {
+        cat(paste("- ", interaction, "\n"))
+      }
+    } else {
+      cat("- No significant interactions detected\n")
+    }
+    next
+  }
+  
+  cat(paste("\nHierarchical Structure for", var, ":\n"))
+  
+  if (is.character(hierarchy_summary[[var]])) {
+    cat(paste("- ", hierarchy_summary[[var]], "\n"))
+  } else if (length(hierarchy_summary[[var]]) == 0) {
+    cat("- No significant hierarchical structure detected\n")
+  } else {
+    for (diff_key in names(hierarchy_summary[[var]])) {
+      cat(paste("\n  ", diff_key, ":\n"))
+      significant_diffs <- hierarchy_summary[[var]][[diff_key]]
+      
+      for (i in 1:nrow(significant_diffs)) {
+        var_name <- significant_diffs$variable[i]
+        std_diff <- significant_diffs$std_diff[i]
+        direction <- ifelse(std_diff > 0, "more", "less")
+        
+        cat(paste("  - ", var_name, "is", direction, "important (std_diff =", 
+                round(std_diff, 2), ")\n"))
+      }
+    }
+  }
+}
+```
+
+```{r}
+## Permutation Decision Trees for Hierarchical Structure Analysis
+## This code explores potential hierarchical structures in a logistic regression model
+
+library(tidyverse)
+library(rpart)        # For decision trees
+library(rpart.plot)   # For visualization
+library(caret)        # For model evaluation and permutation importance
+library(randomForest) # For variable importance
+library(gridExtra)    # For plot arrangement
+library(pROC)         # For ROC curves
+
+# Using the existing baseline data from your code
+# baseline_data is already created and contains the necessary variables
+
+# 1. Initial exploration with a decision tree
+set.seed(123) # For reproducibility
+
+# Train a decision tree
+tree_model <- rpart(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                   data = baseline_data,
+                   method = "class",
+                   control = rpart.control(cp = 0.01)) # Complexity parameter
+
+# Plot the decision tree
+rpart.plot(tree_model, 
+           extra = 106,           # Show sample sizes and percentages
+           box.palette = "RdBu",  # Red-Blue color scheme
+           shadow.col = "gray",   # Shadow color for branches
+           nn = TRUE,             # Display node numbers
+           main = "Decision Tree for Treatment Discontinuation")
+
+# Print summary of the tree
+printcp(tree_model)
+
+# 2. Cross-validation to find the optimal complexity parameter
+set.seed(234)
+cv_tree <- rpart(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                data = baseline_data,
+                method = "class",
+                control = rpart.control(cp = 0.001, xval = 10))
+
+# Plot cross-validation results
+plotcp(cv_tree)
+
+# Find the optimal cp value
+optimal_cp <- cv_tree$cptable[which.min(cv_tree$cptable[,"xerror"]), "CP"]
+cat("Optimal complexity parameter:", optimal_cp, "\n")
+
+# Prune the tree using the optimal cp
+pruned_tree <- prune(cv_tree, cp = optimal_cp)
+
+# Plot the pruned tree
+rpart.plot(pruned_tree, 
+           extra = 106, 
+           box.palette = "RdBu",
+           shadow.col = "gray",
+           nn = TRUE,
+           main = "Pruned Decision Tree for Treatment Discontinuation")
+
+# 3. Permutation importance analysis
+# Using caret's varImp for permutation-based importance
+set.seed(345)
+
+# Create a train control object for importance calculation
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Train a model with caret (using rpart) for variable importance
+caret_model <- train(
+  treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = baseline_data,
+  method = "rpart",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = data.frame(cp = optimal_cp)
+)
+
+# Extract variable importance
+var_importance <- varImp(caret_model, scale = TRUE)
+print(var_importance)
+plot(var_importance, main = "Variable Importance")
+
+# 4. Manual permutation importance calculation for more detailed insights
+calculate_permutation_importance <- function(model, data, target_var, n_permutations = 100) {
+  # Original model accuracy
+  predictions <- predict(model, newdata = data, type = "class")
+  original_accuracy <- mean(predictions == data[[target_var]])
+  
+  # Store importance scores
+  importance_scores <- numeric(length(model$variable.importance))
+  names(importance_scores) <- names(model$variable.importance)
+  
+  # For each variable
+  for (var in names(model$variable.importance)) {
+    accuracy_drops <- numeric(n_permutations)
+    
+    # Perform multiple permutations
+    for (i in 1:n_permutations) {
+      # Create a copy of the data with the variable permuted
+      perm_data <- data
+      perm_data[[var]] <- sample(perm_data[[var]])
+      
+      # Predict with permuted data
+      perm_predictions <- predict(model, newdata = perm_data, type = "class")
+      perm_accuracy <- mean(perm_predictions == data[[target_var]])
+      
+      # Store the drop in accuracy
+      accuracy_drops[i] <- original_accuracy - perm_accuracy
+    }
+    
+    # Average accuracy drop is the importance
+    importance_scores[var] <- mean(accuracy_drops)
+  }
+  
+  return(importance_scores)
+}
+
+# Train a random forest for more robust variable importance
+rf_model <- randomForest(
+  treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = baseline_data,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Plot random forest variable importance
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+
+# 5. Subgroup analysis based on tree splits
+# First, identify the main split variable(s) from the tree
+main_splits <- as.character(pruned_tree$frame$var[1:3])
+main_splits <- main_splits[main_splits != "<leaf>"]
+cat("Main split variables:", paste(main_splits, collapse = ", "), "\n")
+
+# Function to perform subgroup analysis
+subgroup_analysis <- function(data, split_var) {
+  # If the split variable is categorical
+  if (is.factor(data[[split_var]])) {
+    subgroups <- levels(data[[split_var]])
+    models <- list()
+    results <- data.frame(Subgroup = character(), Variable = character(), 
+                          Coefficient = numeric(), P_Value = numeric(), 
+                          stringsAsFactors = FALSE)
+    
+    for (sg in subgroups) {
+      sg_data <- data %>% filter(!!sym(split_var) == sg)
+      
+      # Skip if subgroup is too small
+      if (nrow(sg_data) < 10) {
+        cat("Skipping subgroup", sg, "due to small sample size\n")
+        next
+      }
+      
+      # Fit model without the split variable
+      formula_str <- paste("treatment_status ~", 
+                         paste(setdiff(c("QSEQQALY", "AGE", "SEX", "DMSMK", "RFCTCAVI", "VSBMI", "LBESR"), split_var), 
+                               collapse = " + "))
+      sg_model <- glm(as.formula(formula_str), data = sg_data, family = binomial())
+      models[[sg]] <- sg_model
+      
+      # Extract coefficients
+      coefs <- summary(sg_model)$coefficients
+      for (i in 2:nrow(coefs)) { # Skip intercept
+        var_name <- rownames(coefs)[i]
+        results <- rbind(results, data.frame(
+          Subgroup = sg,
+          Variable = var_name,
+          Coefficient = coefs[i, "Estimate"],
+          P_Value = coefs[i, "Pr(>|z|)"]
+        ))
+      }
+    }
+    
+    return(list(models = models, results = results))
+  } else {
+    # If the split variable is continuous, use a median split
+    median_val <- median(data[[split_var]], na.rm = TRUE)
+    subgroups <- c("Below_Median", "Above_Median")
+    models <- list()
+    results <- data.frame(Subgroup = character(), Variable = character(), 
+                          Coefficient = numeric(), P_Value = numeric(), 
+                          stringsAsFactors = FALSE)
+    
+    # Below median
+    sg_data_below <- data %>% filter(!!sym(split_var) <= median_val)
+    formula_str <- paste("treatment_status ~", 
+                       paste(setdiff(c("QSEQQALY", "AGE", "SEX", "DMSMK", "RFCTCAVI", "VSBMI", "LBESR"), split_var), 
+                             collapse = " + "))
+    sg_model_below <- glm(as.formula(formula_str), data = sg_data_below, family = binomial())
+    models[["Below_Median"]] <- sg_model_below
+    
+    # Extract coefficients for below median
+    coefs <- summary(sg_model_below)$coefficients
+    for (i in 2:nrow(coefs)) { # Skip intercept
+      var_name <- rownames(coefs)[i]
+      results <- rbind(results, data.frame(
+        Subgroup = "Below_Median",
+        Variable = var_name,
+        Coefficient = coefs[i, "Estimate"],
+        P_Value = coefs[i, "Pr(>|z|)"]
+      ))
+    }
+    
+    # Above median
+    sg_data_above <- data %>% filter(!!sym(split_var) > median_val)
+    sg_model_above <- glm(as.formula(formula_str), data = sg_data_above, family = binomial())
+    models[["Above_Median"]] <- sg_model_above
+    
+    # Extract coefficients for above median
+    coefs <- summary(sg_model_above)$coefficients
+    for (i in 2:nrow(coefs)) { # Skip intercept
+      var_name <- rownames(coefs)[i]
+      results <- rbind(results, data.frame(
+        Subgroup = "Above_Median",
+        Variable = var_name,
+        Coefficient = coefs[i, "Estimate"],
+        P_Value = coefs[i, "Pr(>|z|)"]
+      ))
+    }
+    
+    return(list(models = models, results = results))
+  }
+}
+
+# Perform subgroup analysis for the main split variables
+subgroup_results <- list()
+for (var in main_splits) {
+  cat("\nSubgroup analysis for", var, "\n")
+  subgroup_results[[var]] <- subgroup_analysis(baseline_data, var)
+  
+  # Print a summary of the subgroup analysis
+  cat("Coefficient differences across subgroups:\n")
+  sg_results <- subgroup_results[[var]]$results
+  
+  # For each variable, compare coefficients across subgroups
+  variables <- unique(sg_results$Variable)
+  for (v in variables) {
+    coeffs <- sg_results %>% filter(Variable == v) %>% pull(Coefficient)
+    if (length(coeffs) > 1) {
+      coeff_diff <- max(coeffs) - min(coeffs)
+      cat("  Variable", v, "- Max difference:", round(coeff_diff, 3), "\n")
+    }
+  }
+  
+  # Visualization of subgroup differences
+  ggplot(sg_results, aes(x = Variable, y = Coefficient, fill = Subgroup)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_minimal() +
+    labs(title = paste("Coefficient Comparison Across", var, "Subgroups"),
+         x = "Variable", y = "Coefficient") +
+    coord_flip() +
+    scale_fill_brewer(palette = "Set1") +
+    theme(legend.position = "bottom")
+  
+  ggsave(paste0("subgroup_analysis_", var, ".png"), width = 10, height = 6)
+}
+
+# 6. Creating interaction terms based on tree structure
+# Identify potential interactions from the decision tree
+potential_interactions <- combn(main_splits, 2, simplify = FALSE)
+
+# Add interaction terms and evaluate model improvement
+interaction_results <- data.frame(
+  Interaction = character(),
+  AIC_Base = numeric(),
+  AIC_With_Interaction = numeric(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Base model without interactions
+base_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                data = baseline_data, 
+                family = binomial())
+base_aic <- AIC(base_model)
+
+# Test each potential interaction
+for (int in potential_interactions) {
+  int_formula <- as.formula(paste("treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR +", 
+                               paste(int, collapse = ":")))
+  
+  int_model <- glm(int_formula, data = baseline_data, family = binomial())
+  int_aic <- AIC(int_model)
+  
+  # Test if interaction is significant
+  anova_result <- anova(base_model, int_model, test = "Chisq")
+  p_value <- anova_result$`Pr(>Chi)`[2]
+  
+  interaction_results <- rbind(interaction_results, data.frame(
+    Interaction = paste(int, collapse = ":"),
+    AIC_Base = base_aic,
+    AIC_With_Interaction = int_aic,
+    P_Value = p_value
+  ))
+}
+
+# Display interaction results
+print(interaction_results %>% arrange(P_Value))
+
+# Visualize AIC changes with interactions
+ggplot(interaction_results, aes(x = reorder(Interaction, -AIC_With_Interaction), 
+                              y = AIC_With_Interaction, 
+                              fill = P_Value < 0.05)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = base_aic, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "AIC Comparison with Interaction Terms",
+       subtitle = paste("Base model AIC:", round(base_aic, 2)),
+       x = "Interaction", y = "AIC") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("grey", "green"), name = "Significant")
+
+ggsave("interaction_aic_comparison.png", width = 10, height = 6)
+
+# 7. Final model with significant interactions
+# Filter for significant interactions
+sig_interactions <- interaction_results %>% 
+  filter(P_Value < 0.05) %>% 
+  pull(Interaction)
+
+if (length(sig_interactions) > 0) {
+  # Create formula with all significant interactions
+  final_formula_str <- paste("treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR +", 
+                           paste(sig_interactions, collapse = " + "))
+  
+  final_model <- glm(as.formula(final_formula_str), data = baseline_data, family = binomial())
+  
+  # Model summary
+  cat("\nFinal Model with Significant Interactions:\n")
+  print(summary(final_model))
+  
+  # Compare with original model
+  cat("\nModel Comparison (Original vs. With Interactions):\n")
+  print(anova(full_model, final_model, test = "Chisq"))
+  
+  # Predictions with final model
+  predicted_probs_final <- predict(final_model, type = "response")
+  predicted_class_final <- ifelse(predicted_probs_final > 0.5, "Discontinue", "Continue")
+  
+  # Confusion matrix
+  confmat_final <- table(Predicted = predicted_class_final, 
+                        Actual = baseline_data$treatment_status)
+  print(confmat_final)
+  
+  # Calculate model metrics
+  accuracy_original <- sum(diag(confmat_full)) / sum(confmat_full)
+  accuracy_final <- sum(diag(confmat_final)) / sum(confmat_final)
+  
+  # ROC curves comparison
+  roc_original <- roc(baseline_data$treatment_status, predicted_probs_full)
+  roc_final <- roc(baseline_data$treatment_status, predicted_probs_final)
+  
+  # Plot ROC curves
+  plot(roc_original, col = "blue", main = "ROC Curve Comparison")
+  lines(roc_final, col = "red")
+  legend("bottomright", legend = c(paste("Original, AUC =", round(auc(roc_original), 3)),
+                                paste("With Interactions, AUC =", round(auc(roc_final), 3))),
+         col = c("blue", "red"), lwd = 2)
+  
+  # Summary of improvement
+  cat("\nModel Performance Comparison:\n")
+  cat("Original model accuracy:", round(accuracy_original, 3), "\n")
+  cat("Final model accuracy:", round(accuracy_final, 3), "\n")
+  cat("Original model AUC:", round(auc(roc_original), 3), "\n")
+  cat("Final model AUC:", round(auc(roc_final), 3), "\n")
+} else {
+  cat("\nNo significant interactions found. The original model is preferred.\n")
+}
+
+# 8. Cross-validation of hierarchical models
+set.seed(456)
+
+# Function to perform cross-validation
+cv_performance <- function(formula, data, folds = 5) {
+  set.seed(123)
+  fold_indices <- sample(1:folds, nrow(data), replace = TRUE)
+  
+  accuracy <- numeric(folds)
+  auc <- numeric(folds)
+  
+  for (i in 1:folds) {
+    # Split data
+    train_data <- data[fold_indices != i, ]
+    test_data <- data[fold_indices == i, ]
+    
+    # Train model
+    model <- glm(formula, data = train_data, family = binomial())
+    
+    # Predict
+    pred_probs <- predict(model, newdata = test_data, type = "response")
+    pred_class <- ifelse(pred_probs > 0.5, "Discontinue", "Continue")
+    
+    # Calculate metrics
+    accuracy[i] <- mean(pred_class == test_data$treatment_status)
+    
+    # AUC (try-catch to handle potential errors)
+    tryCatch({
+      roc_obj <- roc(test_data$treatment_status, pred_probs)
+      auc[i] <- auc(roc_obj)
+    }, error = function(e) {
+      cat("Error calculating AUC for fold", i, ":", e$message, "\n")
+      auc[i] <- NA
+    })
+  }
+  
+  return(list(accuracy = mean(accuracy, na.rm = TRUE), 
+              auc = mean(auc, na.rm = TRUE)))
+}
+
+# Original model formula
+original_formula <- as.formula("treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR")
+
+# Cross-validation for original model
+cv_original <- cv_performance(original_formula, baseline_data)
+
+# If we have significant interactions, also cross-validate the final model
+if (length(sig_interactions) > 0) {
+  final_formula <- as.formula(final_formula_str)
+  cv_final <- cv_performance(final_formula, baseline_data)
+  
+  # Compare cross-validation results
+  cat("\nCross-Validation Results:\n")
+  cat("Original Model - Accuracy:", round(cv_original$accuracy, 3), 
+      "AUC:", round(cv_original$auc, 3), "\n")
+  cat("Final Model with Interactions - Accuracy:", round(cv_final$accuracy, 3), 
+      "AUC:", round(cv_final$auc, 3), "\n")
+} else {
+  cat("\nCross-Validation Results for Original Model:\n")
+  cat("Accuracy:", round(cv_original$accuracy, 3), 
+      "AUC:", round(cv_original$auc, 3), "\n")
+}
+
+# 9. Summary of findings and recommendations
+cat("\n==========================================\n")
+cat("SUMMARY OF HIERARCHICAL STRUCTURE ANALYSIS\n")
+cat("==========================================\n\n")
+
+cat("1. Main variables forming hierarchical structure:\n")
+for (var in main_splits) {
+  cat("  -", var, "\n")
+}
+
+cat("\n2. Subgroup differences detected:\n")
+for (var in names(subgroup_results)) {
+  sg_results <- subgroup_results[[var]]$results
+  variables <- unique(sg_results$Variable)
+  
+  cat("  For subgroups of", var, ":\n")
+  for (v in variables) {
+    var_results <- sg_results %>% filter(Variable == v)
+    if (nrow(var_results) > 1) {
+      # Check if there's a significant difference (at least one p < 0.05)
+      sig_effect <- any(var_results$P_Value < 0.05)
+      if (sig_effect) {
+        p_values <- var_results %>% filter(P_Value < 0.05) %>% pull(Subgroup)
+        cat("    -", v, "has significant effect in subgroups:", 
+            paste(p_values, collapse = ", "), "\n")
+      }
+    }
+  }
+}
+
+cat("\n3. Significant interaction terms:\n")
+if (length(sig_interactions) > 0) {
+  for (int in sig_interactions) {
+    int_result <- interaction_results %>% filter(Interaction == int)
+    cat("  -", int, "(p =", round(int_result$P_Value, 3), ")\n")
+  }
+} else {
+  cat("  No significant interactions detected\n")
+}
+
+cat("\n4. Performance improvement with hierarchical structure:\n")
+if (exists("accuracy_final")) {
+  acc_change <- (accuracy_final - accuracy_original) / accuracy_original * 100
+  auc_change <- (auc(roc_final) - auc(roc_original)) / auc(roc_original) * 100
+  
+  cat("  - Accuracy: ", 
+      ifelse(acc_change > 0, "Increased by ", "Decreased by "), 
+      abs(round(acc_change, 1)), "%\n", sep = "")
+  cat("  - AUC: ", 
+      ifelse(auc_change > 0, "Increased by ", "Decreased by "), 
+      abs(round(auc_change, 1)), "%\n", sep = "")
+} else {
+  cat("  No performance comparison possible as no significant hierarchical structures were identified\n")
+}
+
+cat("\n5. Recommendations:\n")
+if (length(sig_interactions) > 0) {
+  cat("  - Consider using the model with interaction terms:\n")
+  cat("    ", final_formula_str, "\n\n")
+  cat("  - Develop separate prediction models for the following subgroups:\n")
+  for (var in main_splits) {
+    cat("    - Based on", var, "\n")
+  }
+} else {
+  cat("  - The original model appears to adequately capture the data structure\n")
+  cat("  - No strong evidence for hierarchical structure was found\n")
+}
+```
+
+
+2. Baseline model without QALY
+```{r}
+baseline_model <- glm(treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                      data = baseline_data, 
+                      family = binomial())
+
+# Model summary
+summary(baseline_model)
+
+# Assess model performance
+# Calculate predictions
+predicted_probs_baseline <- predict(baseline_model, type = "response")
+predicted_class_baseline <- ifelse(predicted_probs_baseline > 0.5, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_baseline <- table(Predicted = predicted_class_baseline, 
+                        Actual = baseline_data$treatment_status)
+print(confmat_baseline)
+
+# accuracy
+accuracy_baseline <- sum(diag(confmat_baseline)) / sum(confmat_baseline)
+print(paste("Baseline model accuracy:", round(accuracy_baseline * 100, 2), "%"))
+
+# ROC and AUC for baseline model
+roc_baseline <- roc(baseline_data$treatment_status, predicted_probs_baseline)
+auc_baseline <- auc(roc_baseline)
+print(paste("Baseline model AUC:", round(auc_baseline, 4)))
+
+# Nagelkerke's R² for baseline model
+null_model <- glm(treatment_status ~ 1, data = baseline_data, family = binomial())
+r2_nagelkerke_baseline <- 1 - exp((null_model$deviance - baseline_model$deviance) / nrow(baseline_data))
+r2_nagelkerke_baseline <- r2_nagelkerke_baseline / (1 - exp(-null_model$deviance / nrow(baseline_data)))
+print(paste("Baseline model Nagelkerke's R²:", round(r2_nagelkerke_baseline, 4)))
+```
+
+4. Full model with QALY
+```{r}
+full_model <- glm(treatment_status ~ QSEQQALY_latent + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data_with_tobit, 
+                  family = binomial())
+
+# Model summary
+summary(full_model)
+
+# predictions
+predicted_probs_full <- predict(full_model, type = "response")
+predicted_class_full <- ifelse(predicted_probs_full > 0.5, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full <- table(Predicted = predicted_class_full, 
+                    Actual = baseline_data$treatment_status)
+print(confmat_full)
+
+# accuracy
+accuracy_full <- sum(diag(confmat_full)) / sum(confmat_full)
+print(paste("Full model accuracy:", round(accuracy_full * 100, 2), "%"))
+
+# ROC and AUC for full model
+roc_full <- roc(baseline_data$treatment_status, predicted_probs_full)
+auc_full <- auc(roc_full)
+print(paste("Full model AUC:", round(auc_full, 4)))
+
+# Nagelkerke's R² for full model
+r2_nagelkerke_full <- 1 - exp((null_model$deviance - full_model$deviance) / nrow(baseline_data))
+r2_nagelkerke_full <- r2_nagelkerke_full / (1 - exp(-null_model$deviance / nrow(baseline_data)))
+print(paste("Full model Nagelkerke's R²:", round(r2_nagelkerke_full, 4)))
+
+# contribution of QALY + delta
+r2_difference <- r2_nagelkerke_full - r2_nagelkerke_baseline
+print(paste("QSEQQALY contribution to Nagelkerke's R²:", round(r2_difference, 4)))
+print(paste("Percent improvement:", round(r2_difference/r2_nagelkerke_baseline * 100, 2), "%"))
+
+# Likelihood ratio test to compare models
+lr_test <- anova(baseline_model, full_model, test = "Chisq")
+print(lr_test)
+```
+
+5. (NEW) Cross-validation to evaluate robustness
+```{r}
+# 5. Cross-validation to evaluate robustness
+# Set up cross-validation
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Convert variables to required format for caret
+model_data <- baseline_data_with_tobit %>%
+  select(-CMQUIT_GROUP_2, -SUBJNO, -BACES) %>% # Remove unnecessary variables
+  select(-QSEQQALY_fitted, -QSEQQALY_residuals, -QSEQQALY) %>%
+  na.omit() # Remove any missing values
+
+# Train model with baseline variables only
+cv_model_baseline <- train(
+  treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Train model with QSEQQALY included
+cv_model_full <- train(
+  treatment_status ~ QSEQQALY_latent + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Compare results
+print("Cross-validation results for baseline model:")
+print(cv_model_baseline)
+print(cv_model_baseline$results)
+
+print("Cross-validation results for full model (with QSEQQALY):")
+print(cv_model_full)
+print(cv_model_full$results)
+
+# Calculate improvement in cross-validated AUC
+cv_improvement <- cv_model_full$results$ROC - cv_model_baseline$results$ROC
+print(paste("Cross-validated AUC improvement with QSEQQALY:", round(cv_improvement, 4)))
+
+```
+
+6. Variable importance and visualization
+```{r}
+# odds ratios with confidence intervals
+odds_ratios <- exp(cbind(OR = coef(full_model), confint(full_model)))
+print("Odds ratios with 95% confidence intervals:")
+print(odds_ratios)
+
+# variable importance by drop-in-deviance method
+calculate_importance <- function(full_model, data) {
+  # Get all predictors
+  predictors <- attr(terms(full_model), "term.labels")
+  
+  # Initialize results dataframe
+  importance_df <- data.frame(
+    variable = character(),
+    deviance = numeric(),
+    chi_square = numeric(),
+    p_value = numeric(),
+    importance = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Full model deviance
+  full_deviance <- full_model$deviance
+  
+  # Loop through each predictor
+  for (pred in predictors) {
+    # Create formula without this predictor
+    reduced_formula <- as.formula(
+      paste("treatment_status ~", 
+            paste(predictors[predictors != pred], collapse = " + "))
+    )
+    
+    # Fit reduced model
+    reduced_model <- glm(reduced_formula, data = data, family = binomial())
+    reduced_deviance <- reduced_model$deviance
+    
+    # Calculate chi-square
+    chi_sq <- reduced_deviance - full_deviance
+    df <- full_model$df.residual - reduced_model$df.residual
+    p_val <- pchisq(chi_sq, df = df, lower.tail = FALSE)
+    
+    # Calculate normalized importance (chi-square per df)
+    importance <- chi_sq / df
+    
+    # Add to results
+    importance_df <- rbind(importance_df, data.frame(
+      variable = pred,
+      deviance = reduced_deviance,
+      chi_square = chi_sq,
+      p_value = p_val,
+      importance = importance
+    ))
+  }
+  
+  # Sort by importance
+  importance_df <- importance_df %>%
+    arrange(desc(importance))
+  
+  return(importance_df)
+}
+
+# variable importance
+var_importance <- calculate_importance(full_model, baseline_data_with_tobit)
+print(var_importance)
+```
+
+7. Plot predicted probabilities against QSEQQALY
+```{r}
+# Create a grid of QSEQQALY values
+qseqqaly_range <- seq(min(baseline_data_with_tobit$QSEQQALY_latent, na.rm = TRUE), 
+                      max(baseline_data_with_tobit$QSEQQALY_latent, na.rm = TRUE), 
+                      length.out = 100)
+
+# Create a dataframe with the mean/median of other predictors
+new_data <- expand.grid(
+  QSEQQALY_latent = qseqqaly_range,
+  AGE = median(baseline_data$AGE, na.rm = TRUE),
+  SEX = levels(baseline_data$SEX)[1],
+  DMSMK = levels(baseline_data$DMSMK)[1],
+  VSBMI = median(baseline_data$VSBMI, na.rm = TRUE),
+  RFCTCAVI = levels(baseline_data$RFCTCAVI)[1],
+  LBESR = median(baseline_data$LBESR, na.rm = TRUE)
+)
+
+# predicted probabilities
+new_data$predicted_prob <- predict(full_model, newdata = new_data, type = "response")
+
+ggplot(new_data, aes(x = QSEQQALY_latent, y = predicted_prob)) +
+  geom_line(size = 1.2, color = "#3366CC") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  labs(title = "Probability of Treatment Discontinuation by QSEQQALY Score",
+       x = "QSEQQALY Score at Baseline",
+       y = "Probability of Discontinuation (Group C)") +
+  theme_bw()
+```
+
+8. ROC curve comparison
+```{r}
+# ROC curves for all models
+roc_plot <- ggroc(list(
+  "Baseline Model" = roc_baseline,
+  "Full Model" = roc_full,
+  "QSEQQALY-only Model" = roc_qseqqaly
+)) +
+  labs(title = "ROC Curves for Treatment Discontinuation Prediction",
+       subtitle = paste("AUC - Baseline:", round(auc_baseline, 3),
+                        "| Full:", round(auc_full, 3),
+                        "| QSEQQALY-only:", round(auc_qseqqaly, 3))) +
+  theme_bw()
+
+print(roc_plot)
+```
+
+
