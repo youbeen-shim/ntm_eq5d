@@ -1,0 +1,364 @@
+---
+title: "regression methods"
+author: "Youbeen Shim"
+date: "2025-03-21"
+output: html_document
+---
+
+```{r}
+library(tidyverse)   
+library(nnet)        # For multinomial logistic regression
+library(caret)       # For model evaluation
+library(pROC)        # For ROC curves
+library(sjPlot)      # For visualization of results
+library(car)         # For VIF calculation
+
+# data
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+
+# Filter for baseline data only (time == "B")
+baseline_data <- data %>% 
+  filter(time == "B") %>%
+  select(SUBJNO, 
+         CMQUIT_GROUP_2, 
+         QSEQQALY, 
+         AGE, 
+         SEX,
+         DMSMK, # 0 = never ; 1 = former ; (2 = current, but no observed current smokers in this study)
+         RFCTCAVI,
+         VSBMI, 
+         LBESR, 
+         BACES) # BACES is a function of age/bmi/cavi/esr/sex
+
+## To add QALY_delta
+ updated_eq5d <- data %>%
+   filter(time == "6M") %>%
+   select(SUBJNO, QSEQQALY) %>%
+   rename(QSEQQALY_6M = QSEQQALY)
+ 
+baseline_data <- left_join(baseline_data, updated_eq5d, by = "SUBJNO") %>%
+   mutate(QSEQQALY_delta = QSEQQALY_6M - QSEQQALY)
+
+# Create the binary outcome variable: "Continue" (A or B) vs. "Discontinue" (C)
+baseline_data <- baseline_data %>%
+  mutate(treatment_status = case_when(
+    CMQUIT_GROUP_2 %in% c("A", "B") ~ "Continue",
+    CMQUIT_GROUP_2 == "C" ~ "Discontinue",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(treatment_status = factor(treatment_status, levels = c("Continue", "Discontinue")))
+
+# Check for missing data
+missing_data <- baseline_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "variable", 
+               values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+print(missing_data)
+
+# Factorize categorical variables
+baseline_data <- baseline_data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    DMSMK = factor(DMSMK),
+    RFCTCAVI = factor(RFCTCAVI)
+  ) %>%
+  drop_na() 
+
+# Explicitly specifying that "Discontinue" is the "positive" label
+# (the label that we would like to predict)
+baseline_data$treatment_status <- relevel(factor(baseline_data$treatment_status), ref = "Continue")
+
+summary(baseline_data)
+```
+
+2. Baseline model without QALY
+```{r}
+baseline_model <- glm(treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                      data = baseline_data, 
+                      family = binomial())
+
+# Model summary
+summary(baseline_model)
+
+# Assess model performance
+# Calculate predictions
+predicted_probs_baseline <- predict(baseline_model, type = "response")
+predicted_class_baseline <- ifelse(predicted_probs_baseline > 0.5, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_baseline <- table(Predicted = predicted_class_baseline, 
+                        Actual = baseline_data$treatment_status)
+print(confmat_baseline)
+
+# accuracy
+accuracy_baseline <- sum(diag(confmat_baseline)) / sum(confmat_baseline)
+print(paste("Baseline model accuracy:", round(accuracy_baseline * 100, 2), "%"))
+
+# ROC and AUC for baseline model
+roc_baseline <- roc(baseline_data$treatment_status, predicted_probs_baseline, levels = c("Continue", "Discontinue"), direction = "<")
+auc_baseline <- auc(roc_baseline)
+print(paste("Baseline model AUC:", round(auc_baseline, 4)))
+```
+
+3. Full model with QALY
+```{r}
+full_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data, 
+                  family = binomial())
+
+# Model summary
+summary(full_model)
+
+# predictions
+predicted_probs_full <- predict(full_model, type = "response")
+predicted_class_full <- ifelse(predicted_probs_full > 0.5, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full <- table(Predicted = predicted_class_full, 
+                      Actual = baseline_data$treatment_status)
+print(confmat_full)
+
+# accuracy
+accuracy_full <- sum(diag(confmat_full)) / sum(confmat_full)
+print(paste("Full model accuracy:", round(accuracy_full * 100, 2), "%"))
+
+# ROC and AUC for full model
+roc_full <- roc(baseline_data$treatment_status, predicted_probs_full, levels = c("Continue", "Discontinue"), direction = "<")
+auc_full <- auc(roc_full)
+print(paste("Full model AUC:", round(auc_full, 4)))
+# Likelihood ratio test to compare models
+lr_test <- anova(baseline_model, full_model, test = "Chisq")
+print(lr_test)
+```
+
+w/ 6m update
+```{r}
+full_model_plus <- glm(treatment_status ~ QSEQQALY + QSEQQALY_delta + 
+                         AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data, 
+                  family = binomial())
+
+# Model summary
+summary(full_model_plus)
+
+# predictions
+predicted_probs_full_plus <- predict(full_model_plus, type = "response")
+predicted_class_full_plus <- ifelse(predicted_probs_full_plus > 0.5, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full_plus <- table(Predicted = predicted_class_full, 
+                    Actual = baseline_data$treatment_status)
+print(confmat_full_plus)
+
+# accuracy
+accuracy_full_plus <- sum(diag(confmat_full_plus)) / sum(confmat_full_plus)
+print(paste("Full model accuracy:", round(accuracy_full_plus * 100, 2), "%"))
+
+# ROC and AUC for full model w/ 6m update
+roc_full_plus <- roc(baseline_data$treatment_status, predicted_probs_full_plus, levels = c("Continue", "Discontinue"), direction = "<")
+auc_full_plus <- auc(roc_full_plus)
+print(paste("Full model AUC:", round(auc_full_plus, 4)))
+
+# Likelihood ratio test to compare models
+lr_test <- anova(baseline_model, full_model_plus, test = "Chisq")
+print(lr_test)
+```
+
+5. Cross-validation to evaluate robustness
+```{r}
+# Set up cross-validation
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Convert variables to required format for caret
+model_data <- baseline_data %>%
+  select(-CMQUIT_GROUP_2, -SUBJNO, -BACES) %>% # Remove unnecessary variables
+  na.omit()  %>% # Remove any missing values
+  mutate(treatment_status = factor(treatment_status, levels = c("Discontinue", "Continue")))
+
+# Train model with baseline variables only
+cv_model_baseline <- train(
+  treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Train model with QSEQQALY included
+cv_model_full <- train(
+  treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Compare results
+print("Cross-validation results for baseline model:")
+print(cv_model_baseline)
+print(cv_model_baseline$results)
+
+print("Cross-validation results for full model (with QSEQQALY):")
+print(cv_model_full)
+print(cv_model_full$results)
+
+# Calculate improvement in cross-validated AUC
+cv_improvement <- cv_model_full$results$ROC - cv_model_baseline$results$ROC
+print(paste("Cross-validated AUC improvement with QSEQQALY:", round(cv_improvement, 4)))
+
+```
+
+```{r}
+# Create a function to evaluate metrics at different thresholds
+evaluate_threshold <- function(threshold, probs, actual) {
+  predicted <- ifelse(probs > threshold, "Discontinue", "Continue")
+  cm <- table(Predicted = predicted, Actual = actual)
+  
+  # Calculate metrics
+  sensitivity <- cm["Discontinue", "Discontinue"] / sum(cm[, "Discontinue"])
+  specificity <- cm["Continue", "Continue"] / sum(cm[, "Continue"])
+  accuracy <- sum(diag(cm)) / sum(cm)
+  
+  data.frame(
+    Threshold = threshold,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Accuracy = accuracy
+  )
+}
+
+# Evaluate multiple thresholds
+thresholds <- seq(0.1, 0.5, by = 0.05)
+threshold_results <- do.call(rbind, lapply(thresholds, function(t) {
+  evaluate_threshold(t, predicted_probs_full, baseline_data$treatment_status)
+}))
+
+# Display results
+print(threshold_results)
+
+# Graph
+threshold_results_long <- pivot_longer(threshold_results, 
+                                      cols = c(Sensitivity, Specificity, Accuracy),
+                                      names_to = "Metric",
+                                      values_to = "Value")
+
+ggplot(threshold_results_long, aes(x = Threshold, y = Value, color = Metric, group = Metric)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 0.2, linetype = "dashed") +
+  labs(title = "Performance Metrics at Different Thresholds",
+       subtitle = paste("Optimal threshold:", round(optimal_threshold, 2)),
+       x = "Threshold", 
+       y = "Value") +
+  theme_bw()
+
+# Confusiong Matrix
+predicted_probs_full_wthreshold <- predict(full_model, type = "response")
+predicted_class_full_wthreshold <- ifelse(predicted_probs_full_wthreshold > 0.2, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_full_wthreshold <- table(Predicted = predicted_class_full_wthreshold, 
+                          Actual = baseline_data$treatment_status)
+print(confmat_full_wthreshold)
+```
+
+Plot predicted probabilities against QSEQQALY
+```{r}
+# Create a grid of QSEQQALY values
+qseqqaly_range <- seq(min(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      max(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      length.out = 100)
+
+# Create a dataframe with the mean/median of other predictors
+new_data <- expand.grid(
+  QSEQQALY = qseqqaly_range,
+  AGE = median(baseline_data$AGE, na.rm = TRUE),
+  SEX = levels(baseline_data$SEX)[1],
+  DMSMK = levels(baseline_data$DMSMK)[1],
+  VSBMI = median(baseline_data$VSBMI, na.rm = TRUE),
+  RFCTCAVI = levels(baseline_data$RFCTCAVI)[1],
+  LBESR = median(baseline_data$LBESR, na.rm = TRUE)
+)
+
+# predicted probabilities
+new_data$predicted_prob <- predict(full_model, newdata = new_data, type = "response")
+
+ggplot(new_data, aes(x = QSEQQALY, y = predicted_prob)) +
+  geom_line(size = 1.2, color = "#3366CC") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  labs(title = "Probability of Treatment Discontinuation by QSEQQALY Score",
+       x = "QSEQQALY Score at Baseline",
+       y = "Probability of Discontinuation (Group C)") +
+  theme_bw()
+```
+
+8. ROC curve comparison
+```{r}
+# ROC curves for all models
+roc_plot <- ggroc(list(
+  "Baseline Model" = roc_baseline,
+  "QALY-added Model" = roc_full,
+  "QALY + 6M Update Model" = roc_full_plus
+)) +
+  labs(title = "ROC Curves for Treatment Discontinuation Prediction",
+       subtitle = paste("AUC - Baseline:", round(auc_baseline, 3),
+                        "| QALY-added:", round(auc_full, 3),
+                        "| QALY + 6M Update:", round(auc_full_plus, 3))) +
+  geom_line(aes(x=0.2), linetype="dashed", color="grey" )+
+  theme_bw()
+
+print(roc_plot)
+```
+
+```{r}
+# Filter data for analysis
+tobit_data <- data %>%
+  filter(time == "B") %>%
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365) 
+
+ggplot() +
+  # Raw data points
+  geom_point(data = tobit_data, 
+             aes(x = 0, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1, position=position_jitter(width=0.1)) +
+  theme_minimal()
+
+# histogram of original QSEQQALY values
+ggplot(baseline_data, aes(x = QSEQQALY)) +
+  geom_histogram(bins = 30, fill = "gray", alpha = 0.7, color = "black") +
+  labs(x = NULL, y = "Count") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+# faceted plot with density distribution by outcome
+ggplot(baseline_data, aes(x = QSEQQALY, fill = CMQUIT_GROUP_2)) +
+  geom_density(alpha = 0.5) +
+  geom_rug(aes(color = CMQUIT_GROUP_2), alpha = 0.7) +
+  facet_wrap(~CMQUIT_GROUP_2, ncol = 1) +
+  labs(title = "Distribution of QSEQQALY by Treatment Outcome",
+       x = "QSEQQALY Score at Baseline",
+       y = "Density") +
+  scale_color_manual(values = c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")) +
+  scale_fill_manual(values = c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+
