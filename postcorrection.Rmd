@@ -317,7 +317,7 @@ roc_plot <- ggroc(list(
        subtitle = paste("AUC - Baseline:", round(auc_baseline, 3),
                         "| QALY-added:", round(auc_full, 3),
                         "| QALY + 6M Update:", round(auc_full_plus, 3))) +
-  geom_line(aes(x=0.2), linetype="dashed", color="grey" )+
+  geom_line(aes(x=0.2), linetype="dashed", color="grey" ) +
   theme_bw()
 
 print(roc_plot)

@@ -1,0 +1,704 @@
+---
+title: "regression methods"
+author: "Youbeen Shim"
+date: "2025-03-21"
+output: html_document
+---
+
+Need to show the gap of:
+a) Clinical parameters alone
+b) Clinical parameters + QALY
+c) QALY + BACES score (which incorporates some of the clinical parameters)
+d) QALY alone
+
+```{r}
+library(tidyverse)   
+library(nnet)        # For multinomial logistic regression
+library(caret)       # For model evaluation
+library(pROC)        # For ROC curves
+library(sjPlot)      # For visualization of results
+library(car)         # For VIF calculation
+
+# data
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+
+# Filter for baseline data only (time == "B")
+baseline_data <- data %>% 
+  filter(time == "B") %>%
+  select(SUBJNO, 
+         CMQUIT_GROUP_2, 
+         QSEQQALY, 
+         AGE, 
+         SEX,
+         DMSMK, # 0 = never ; 1 = former ; (2 = current, but no observed current smokers in this study)
+         RFCTCAVI,
+         VSBMI, 
+         LBESR, 
+         BACES, # BACES is a function of age/bmi/cavi/esr/sex
+         MBSPECIES) 
+
+## To add QALY_delta
+# updated_eq5d <- data %>%
+#   filter(time == "6M") %>%
+#   select(SUBJNO, QSEQQALY) %>%
+#   rename(QSEQQALY_6M = QSEQQALY)
+# 
+#baseline_data <- left_join(baseline_data, updated_eq5d, by = "SUBJNO") %>%
+#   mutate(QSEQQALY_delta = QSEQQALY_6M - QSEQQALY)
+
+# Create the binary outcome variable: "Continue" (A or B) vs. "Discontinue" (C)
+baseline_data <- baseline_data %>%
+  mutate(treatment_status = case_when(
+    CMQUIT_GROUP_2 %in% c("A", "B") ~ "Continue",
+    CMQUIT_GROUP_2 == "C" ~ "Discontinue",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(treatment_status = factor(treatment_status, levels = c("Continue", "Discontinue")))
+
+# Check for missing data
+missing_data <- baseline_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "variable", 
+               values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+print(missing_data)
+
+# Factorize categorical variables
+baseline_data <- baseline_data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    DMSMK = factor(DMSMK),
+    RFCTCAVI = factor(RFCTCAVI),
+    MBSPECIES = factor(MBSPECIES)
+  ) %>%
+  drop_na() 
+
+# Explicitly specifying that "Discontinue" is the "positive" label
+# (the label that we would like to predict)
+baseline_data$treatment_status <- relevel(factor(baseline_data$treatment_status), ref = "Continue")
+
+summary(baseline_data)
+```
+
+generating accuracy metrics using confusion matrix
+```{r}
+calculate_metrics <- function(confusion_matrix) {
+  # Check that the confusion matrix has expected labels and dimensions
+  if (!all(rownames(confusion_matrix) %in% c("Continue", "Discontinue")) || 
+      !all(colnames(confusion_matrix) %in% c("Continue", "Discontinue")) ||
+      nrow(confusion_matrix) != 2 || ncol(confusion_matrix) != 2) {
+    stop("Confusion matrix must be 2x2 with rownames and colnames as 'Continue' and 'Discontinue'")
+  }
+  
+  # Extract values
+  TP <- confusion_matrix["Discontinue", "Discontinue"]
+  TN <- confusion_matrix["Continue", "Continue"]
+  FP <- confusion_matrix["Discontinue", "Continue"]
+  FN <- confusion_matrix["Continue", "Discontinue"]
+  
+  # Calculate metrics
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  ppv <- TP / (TP + FP)
+  npv <- TN / (TN + FN)
+  accuracy <- (TP + TN) / sum(confusion_matrix)
+  
+  # Create results table
+  metrics_table <- data.frame(
+    Metric = c("Sensitivity", "Specificity", "PPV", "NPV", "Accuracy"),
+    Value = c(sensitivity, specificity, ppv, npv, accuracy)
+  )
+  
+  return(metrics_table)
+}
+```
+
+
+a. Baseline model without QALY
+```{r}
+clinical_baseline <- glm(treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                        data = baseline_data, 
+                        family = binomial())
+summary(clinical_baeline)
+
+# Model performance
+# predicted_probs
+pp_baseline <- predict(clinical_baeline, type = "response")
+# predicted_class
+pc_baseline <- ifelse(pp_baseline > 0.2, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_baseline <- table(Predicted = pc_baseline, 
+                          Actual = baseline_data$treatment_status)
+print(confmat_baseline)
+
+# accuracy metrics
+metrics_baseline <- calculate_metrics(confmat_baseline)
+print(metrics_baseline)
+
+# ROC and AUC for baseline model
+roc_baseline <- roc(baseline_data$treatment_status, pp_baseline, levels = c("Continue", "Discontinue"), direction = "<")
+auc_baseline <- auc(roc_baseline)
+print(paste("Baseline model AUC:", round(auc_baseline, 4)))
+ci_baseline <- ci.auc(roc_baseline)
+print(ci_baseline)
+
+# AIC and BIC
+aic_baseline <- AIC(clinical_baseline)
+print(aic_baseline)
+bic_baseline <- BIC(clinical_baseline)
+print(bic_baseline)
+```
+
+b. a + QALY
+```{r}
+full_model <- glm(treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+                  data = baseline_data, 
+                  family = binomial())
+summary(full_model)
+
+# predicted_probs
+pp_full <- predict(full_model, type = "response")
+# predicted_class
+pc_full <- ifelse(pp_full > 0.2, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_full <- table(Predicted = pc_full, 
+                      Actual = baseline_data$treatment_status)
+print(confmat_full)
+
+# accuracy metrics
+metrics_full <- calculate_metrics(confmat_full)
+print(metrics_full)
+
+# ROC and AUC for full model
+roc_full <- roc(baseline_data$treatment_status, pp_full, levels = c("Continue", "Discontinue"), direction = "<")
+auc_full <- auc(roc_full)
+print(paste("Full model AUC:", round(auc_full, 4)))
+ci_full <- ci.auc(roc_full)
+print(ci_full)
+
+# AIC and BIC
+aic_full <- AIC(full_model)
+print(aic_full)
+bic_full <- BIC(full_model)
+print(bic_full)
+
+# Likelihood ratio test to compare models
+lr_test <- anova(clinical_baeline, full_model, test = "Chisq")
+print(lr_test)
+```
+
+c. QALY + BACES
+```{r}
+# note: DMSMK variable no longer used
+baces_model <- glm(treatment_status ~ QSEQQALY + BACES,
+                   data = baseline_data, 
+                   family = binomial())
+summary(baces_model)
+
+# predicted_probs
+pp_baces <- predict(baces_model, type = "response")
+# predicted_class
+pc_baces <- ifelse(pp_baces > 0.2, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_baces <- table(Predicted = pc_baces, 
+                       Actual = baseline_data$treatment_status)
+print(confmat_baces)
+
+# accuracy metrics
+metrics_baces <- calculate_metrics(confmat_baces)
+print(metrics_baces)
+
+# ROC and AUC 
+roc_baces <- roc(baseline_data$treatment_status, pp_baces)
+auc_baces <- auc(roc_baces)
+print(paste("BACES model AUC:", round(auc_baces, 4)))
+ci_baces <- ci.auc(roc_baces)
+print(ci_baces)
+
+# AIC and BIC
+aic_baces <- AIC(baces_model)
+print(aic_baces)
+bic_baces <- BIC(baces_model)
+print(bic_baces)
+
+# Likelihood ratio test to compare models
+lr_test <- anova(clinical_baeline, baces_model, test = "Chisq")
+print(lr_test)
+```
+
+d. just QALY
+```{r}
+just_qaly <- glm(treatment_status ~ QSEQQALY,
+                 data = baseline_data, 
+                 family = binomial())
+summary(just_qaly)
+
+# predicted_probs
+pp_qaly <- predict(just_qaly, type = "response")
+# predicted_class 
+pc_qaly <- ifelse(pp_qaly > 0.2, "Discontinue", "Continue")
+
+# confusion matrix
+confmat_qaly <- table(Predicted = pc_qaly, 
+                      Actual = baseline_data$treatment_status)
+print(confmat_qaly)
+
+# accuracy metrics
+metrics_qaly <- calculate_metrics(confmat_qaly)
+print(metrics_qaly)
+
+# ROC and AUC 
+roc_qaly <- roc(baseline_data$treatment_status, pp_qaly)
+auc_qaly <- auc(roc_qaly)
+print(paste("QALY model AUC:", round(auc_qaly, 4)))
+ci_qaly <- ci.auc(roc_qaly)
+print(ci_qaly)
+
+# AIC and BIC
+aic_qaly <- AIC(just_qaly)
+print(aic_qaly)
+bic_qaly <- BIC(just_qaly)
+print(bic_qaly)
+
+# Likelihood ratio test to compare models
+lr_test <- anova(just_qaly, full_model, test = "Chisq")
+print(lr_test)
+
+lr_test <- anova(just_qaly, baces_model, test = "Chisq")
+print(lr_test)
+```
+
+
+5. Cross-validation to evaluate robustness
+```{r}
+# Set up cross-validation
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Convert variables to required format for caret
+model_data <- baseline_data %>%
+  select(-CMQUIT_GROUP_2, -SUBJNO, -BACES) %>% # Remove unnecessary variables
+  na.omit()  %>% # Remove any missing values
+  mutate(treatment_status = factor(treatment_status, levels = c("Discontinue", "Continue")))
+
+# Train model with baseline variables only
+cv_model_baseline <- train(
+  treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Train model with QSEQQALY included
+cv_model_full <- train(
+  treatment_status ~ QSEQQALY + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
+  data = model_data,
+  method = "glm",
+  family = binomial(),
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Compare results
+print("Cross-validation results for baseline model:")
+print(cv_model_baseline)
+print(cv_model_baseline$results)
+
+print("Cross-validation results for full model (with QSEQQALY):")
+print(cv_model_full)
+print(cv_model_full$results)
+
+# Calculate improvement in cross-validated AUC
+cv_improvement <- cv_model_full$results$ROC - cv_model_baseline$results$ROC
+print(paste("Cross-validated AUC improvement with QSEQQALY:", round(cv_improvement, 4)))
+
+```
+
+Calibration
+```{r}
+n_groups = 10
+pred_groups <- cut(pp_baseline, 
+                   breaks = seq(0, 1, length.out = n_groups + 1), 
+                   include.lowest = TRUE)
+
+# Calculate observed event rate in each bin
+cal_data <- tibble(
+  predicted = pp_baseline,
+  observed = as.numeric(baseline_data$treatment_status == "Discontinue"),
+  group = pred_groups
+) %>%
+group_by(group) %>%
+summarise(
+  n = n(),
+  mean_pred = mean(predicted),
+  mean_obs = mean(observed),
+  se = sqrt((mean_obs * (1 - mean_obs)) / n)
+)
+
+# Calculate calibration metrics
+# Calibration-in-the-large (intercept)
+calibration_intercept <- with(cal_data, 
+                              weighted.mean(mean_obs - mean_pred, n))
+
+# Calibration slope
+cal_model <- glm(observed ~ predicted, 
+                data = tibble(
+                  predicted = pp_baseline,
+                  observed = as.numeric(baseline_data$treatment_status == "Discontinue")
+                ), 
+                family = binomial())
+calibration_slope <- coef(cal_model)[2]
+
+# Hosmer-Lemeshow test
+hl_test <- hoslem.test(as.numeric(baseline_data$treatment_status == "Discontinue"), 
+                       pp_baseline, 
+                       g = 10)
+
+# Create plot
+p <- ggplot(cal_data, aes(x = mean_pred, y = mean_obs)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(size = n), alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_obs - 1.96*se, ymax = mean_obs + 1.96*se), width = 0.01) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1) +
+  labs(x = "Predicted Probability", 
+       y = "Observed Frequency", 
+       title = paste("Calibration Plot -", "Baseline Model"),
+       subtitle = paste0("Calibration intercept: ", round(calibration_intercept, 3),
+                        "\nCalibration slope: ", round(calibration_slope, 3),
+                        "\nHL test p-value: ", round(hl_test$p.value, 3))) +
+  theme_minimal() +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme(legend.position = "bottom")
+p
+```
+
+```{r}
+library(ResourceSelection) # For hoslem.test
+library(rms)  # For calibration metrics
+
+# min_frac input filters out the group (in the predicted probability bin) that represents less than 5% of the overall data (out of 179)
+create_calibration_plot <- function(predicted_probs, observed_outcomes, model_name, n_groups = 10, min_frac = 0.05) {
+  total_n <- length(predicted_probs)
+  min_group_size <- ceiling(total_n * min_frac)
+  
+  # Group predictions into bins
+  pred_groups <- cut(predicted_probs, 
+                     breaks = seq(0, 1, length.out = n_groups + 1), 
+                     include.lowest = TRUE)
+  
+  # Calculate observed event rate in each bin
+  cal_data_all <- tibble(
+    predicted = predicted_probs,
+    observed = as.numeric(observed_outcomes == "Discontinue"),
+    group = pred_groups
+  ) %>%
+  group_by(group) %>%
+  summarise(
+    n = n(),
+    mean_pred = mean(predicted),
+    mean_obs = mean(observed),
+    se = sqrt((mean_obs * (1 - mean_obs)) / n)
+  )
+  
+  # Filter out small groups for plot and metrics
+  cal_data <- cal_data_all %>%
+    filter(n >= min_group_size)
+  
+  # Print warning if groups were filtered
+  filtered_groups <- nrow(cal_data_all) - nrow(cal_data)
+  if(filtered_groups > 0) {
+    message(paste0("Note: Removed ", filtered_groups, " small groups (n < ", 
+                   min_group_size, ") from calibration metrics for ", model_name))
+  }
+  
+  # Calculate calibration metrics using filtered data
+  # Calibration-in-the-large (intercept)
+  calibration_intercept <- with(cal_data, 
+                               weighted.mean(mean_obs - mean_pred, n))
+  
+  # Calibration slope - calculated on all data but using robust method
+  # (less affected by extreme values)
+  cal_model <- glm(observed ~ predicted, 
+                  data = tibble(
+                    predicted = predicted_probs,
+                    observed = as.numeric(observed_outcomes == "Discontinue")
+                  ), 
+                  family = binomial(),
+                  method = "glm.fit")
+  calibration_slope <- coef(cal_model)[2]
+  
+  # Hosmer-Lemeshow test
+  hl_test <- hoslem.test(as.numeric(observed_outcomes == "Discontinue"), 
+                         predicted_probs, 
+                         g = 10)
+  
+  # Create plot
+  p <- ggplot(cal_data, aes(x = mean_pred, y = mean_obs)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    geom_point(aes(size = n), alpha = 0.7) +
+    geom_errorbar(aes(ymin = pmax(0, mean_obs - 1.96*se), 
+                      ymax = pmin(1, mean_obs + 1.96*se)), width = 0.01) +
+    geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1) +
+    labs(x = "Predicted Probability", 
+         y = "Observed Frequency", 
+         title = paste("Calibration Plot -", model_name),
+         subtitle = paste0("Calibration intercept: ", round(calibration_intercept, 3),
+                          "\nCalibration slope: ", round(calibration_slope, 3),
+                          "\nHL test p-value: ", round(hl_test$p.value, 3))) +
+    theme_minimal() +
+    coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+    theme(legend.position = "bottom")
+  
+  # Return both plot and metrics
+  return(list(
+    plot = p,
+    metrics = tibble(
+      Model = model_name,
+      Calibration_Intercept = calibration_intercept,
+      Calibration_Slope = calibration_slope,
+      HL_Test_P_Value = hl_test$p.value,
+      Excluded_Groups = filtered_groups
+    ),
+    data = cal_data
+  ))
+}
+
+# a) Clinical parameters alone
+cal_baseline <- create_calibration_plot(pp_baseline, 
+                                       baseline_data$treatment_status, 
+                                       "Clinical Parameters Only")
+cal_baseline$plot
+
+# b) Clinical parameters + QALY
+cal_full <- create_calibration_plot(pp_full, 
+                                   baseline_data$treatment_status, 
+                                   "Clinical Parameters + QALY")
+cal_full$plot
+
+# c) QALY + BACES
+cal_baces <- create_calibration_plot(pp_baces, 
+                                    baseline_data$treatment_status, 
+                                    "QALY + BACES")
+cal_baces$plot
+
+# d) QALY only
+cal_qaly <- create_calibration_plot(pp_qaly, 
+                                   baseline_data$treatment_status, 
+                                   "QALY Only")
+cal_qaly$plot
+
+# Combine all calibration metrics into a single table
+calibration_metrics <- bind_rows(
+  cal_baseline$metrics,
+  cal_full$metrics,
+  cal_baces$metrics,
+  cal_qaly$metrics
+)
+
+# Print summary table
+knitr::kable(calibration_metrics, digits = 3)
+
+# Create a 2x2 grid of all calibration plots
+library(gridExtra)
+grid.arrange(
+  cal_baseline$plot + theme(legend.position = "none") + ggtitle("a) Clinical Parameters Only"),
+  cal_full$plot + theme(legend.position = "none") + ggtitle("b) Clinical Parameters + QALY"),
+  cal_baces$plot + theme(legend.position = "none") + ggtitle("c) QALY + BACES"),
+  cal_qaly$plot + theme(legend.position = "none") + ggtitle("d) QALY Only"),
+  ncol = 2
+)
+```
+
+
+```{r}
+# Create a function to evaluate metrics at different thresholds
+evaluate_threshold <- function(threshold, probs, actual) {
+  predicted <- ifelse(probs > threshold, "Discontinue", "Continue")
+  cm <- table(Predicted = predicted, Actual = actual)
+  
+  # Calculate metrics
+  sensitivity <- cm["Discontinue", "Discontinue"] / sum(cm[, "Discontinue"])
+  specificity <- cm["Continue", "Continue"] / sum(cm[, "Continue"])
+  accuracy <- sum(diag(cm)) / sum(cm)
+  
+  data.frame(
+    Threshold = threshold,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Accuracy = accuracy
+  )
+}
+
+# Evaluate multiple thresholds
+thresholds <- seq(0.1, 0.5, by = 0.05)
+threshold_results <- do.call(rbind, lapply(thresholds, function(t) {
+  evaluate_threshold(t, predicted_probs_full, baseline_data$treatment_status)
+}))
+
+# Display results
+print(threshold_results)
+
+# Graph
+threshold_results_long <- pivot_longer(threshold_results, 
+                                      cols = c(Sensitivity, Specificity, Accuracy),
+                                      names_to = "Metric",
+                                      values_to = "Value")
+
+ggplot(threshold_results_long, aes(x = Threshold, y = Value, color = Metric, group = Metric)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 0.2, linetype = "dashed") +
+  labs(title = "Performance Metrics at Different Thresholds",
+       subtitle = paste("Optimal threshold:", round(optimal_threshold, 2)),
+       x = "Threshold", 
+       y = "Value") +
+  theme_bw()
+
+# Confusiong Matrix
+predicted_probs_full_wthreshold <- predict(full_model, type = "response")
+predicted_class_full_wthreshold <- ifelse(predicted_probs_full_wthreshold > 0.2, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_full_wthreshold <- table(Predicted = predicted_class_full_wthreshold, 
+                          Actual = baseline_data$treatment_status)
+print(confmat_full_wthreshold)
+```
+
+```{r}
+# Confusiong Matrix
+predicted_probs_full_wthreshold <- predict(full_model, type = "response")
+predicted_class_full_wthreshold <- ifelse(predicted_probs_full_wthreshold > 0.15, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_full_wthreshold <- table(Predicted = predicted_class_full_wthreshold, 
+                          Actual = baseline_data$treatment_status)
+print(confmat_full_wthreshold)
+```
+
+
+Plot predicted probabilities against QSEQQALY
+```{r}
+# Create a grid of QSEQQALY values
+qseqqaly_range <- seq(min(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      max(baseline_data$QSEQQALY, na.rm = TRUE), 
+                      length.out = 100)
+
+# Create a dataframe with the mean/median of other predictors
+new_data <- expand.grid(
+  QSEQQALY = qseqqaly_range,
+  AGE = median(baseline_data$AGE, na.rm = TRUE),
+  SEX = levels(baseline_data$SEX)[1],
+  DMSMK = levels(baseline_data$DMSMK)[1],
+  VSBMI = median(baseline_data$VSBMI, na.rm = TRUE),
+  RFCTCAVI = levels(baseline_data$RFCTCAVI)[1],
+  LBESR = median(baseline_data$LBESR, na.rm = TRUE)
+)
+
+# predicted probabilities
+new_data$predicted_prob <- predict(full_model, newdata = new_data, type = "response")
+
+ggplot(new_data, aes(x = QSEQQALY, y = predicted_prob)) +
+  geom_line(size = 1.2, color = "#3366CC") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  labs(title = "Probability of Treatment Discontinuation by QSEQQALY Score",
+       x = "QSEQQALY Score at Baseline",
+       y = "Probability of Discontinuation (Group C)") +
+  theme_bw()
+```
+
+8. ROC curve comparison
+```{r}
+# coordinates for each model at 0.2 threshold
+coords_baseline <- coords(roc_baseline) %>%
+  filter(threshold >= 0.2) %>%
+  slice(1)
+coords_full <- coords(roc_full, threshold = 0.2) %>%
+  filter(threshold >= 0.2) %>%
+  slice(1)
+coords_baces <- coords(roc_baces, threshold = 0.2) %>%
+  filter(threshold >= 0.2) %>%
+  slice(2)
+coords_qaly <- coords(roc_qaly, threshold = 0.2) %>%
+  filter(threshold >= 0.2) %>%
+  slice(1)
+```
+
+```{r}
+# ROC curves for all models
+roc_plot <- ggroc(list(
+  "Baseline Model" = roc_baseline,
+  "Baseline + QALY" = roc_full,
+  "BACES + QALY" = roc_baces,
+  "QALY" = roc_qaly
+)) +
+  geom_point(aes(x = coords_baseline$specificity, y = coords_baseline$sensitivity), color = "red", size = 1) + 
+  geom_point(aes(x = coords_full$specificity, y = coords_full$sensitivity), color = "red", size = 1) + 
+  geom_point(aes(x = coords_baces$specificity, y = coords_baces$sensitivity), color = "red", size = 1) + 
+  geom_point(aes(x = coords_qaly$specificity, y = coords_qaly$sensitivity), color = "red", size = 1) + 
+  labs(title = "ROC Curves for Treatment Discontinuation Prediction",
+       subtitle = paste("AUC - Baseline:", round(auc_baseline, 3),
+                        "| Baseline + QALY:", round(auc_full, 3),
+                        "| BACES + QALY:", round(auc_baces, 3),
+                        "| QALY:", round(auc_qaly, 3),
+                        "\n",
+                        "the 0.2 threshold level is marked with a red dot")) +
+  # reference line
+  # geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.7) +
+  theme_bw()
+
+print(roc_plot)
+```
+
+```{r}
+# Filter data for analysis
+tobit_data <- data %>%
+  filter(time == "B") %>%
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365) 
+
+ggplot() +
+  # Raw data points
+  geom_point(data = tobit_data, 
+             aes(x = 0, y = QSEQQALY, color = CMQUIT_GROUP_2), 
+             alpha = 0.3, size = 1, position=position_jitter(width=0.1)) +
+  theme_minimal()
+
+# histogram of original QSEQQALY values
+ggplot(baseline_data, aes(x = QSEQQALY)) +
+  geom_histogram(bins = 30, fill = "gray", alpha = 0.7, color = "black") +
+  labs(x = NULL, y = "Count") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+# faceted plot with density distribution by outcome
+ggplot(baseline_data, aes(x = QSEQQALY, fill = CMQUIT_GROUP_2)) +
+  geom_density(alpha = 0.5) +
+  geom_rug(aes(color = CMQUIT_GROUP_2), alpha = 0.7) +
+  facet_wrap(~CMQUIT_GROUP_2, ncol = 1) +
+  labs(title = "Distribution of QSEQQALY by Treatment Outcome",
+       x = "QSEQQALY Score at Baseline",
+       y = "Density") +
+  scale_color_manual(values = c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")) +
+  scale_fill_manual(values = c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+

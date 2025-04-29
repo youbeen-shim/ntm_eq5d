@@ -138,7 +138,7 @@ lr_test <- anova(baseline_model, full_model, test = "Chisq")
 print(lr_test)
 ```
 
-w/ 6m update
+with species 
 ```{r}
 full_model_plus <- glm(treatment_status ~ QSEQQALY + MBSPECIES + 
                                           AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
