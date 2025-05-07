@@ -32,7 +32,9 @@ LOESS Regression, Longitudinal Analysis of Quality of Life
 ```{r}
 # Prepare data - filter out rows with missing values for duration or quality of life score
 data_filtered <- data %>%
-  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY))
+  filter(!is.na(QSEQDUR_diff) & !is.na(QSEQQALY)) %>%
+  # Create normalized time variable (in years)
+  mutate(time_years = QSEQDUR_diff/365)
 
 # LOESS regression for each treatment response group
 loess_results <- data_filtered %>%
@@ -58,6 +60,7 @@ loess_results <- data_filtered %>%
   }) %>%
   ungroup()
 
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
 
 # Create visualization of LOESS regression results
 loess_plot <- ggplot() +
