@@ -123,11 +123,11 @@ a. Baseline model without QALY
 clinical_baseline <- glm(treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR,
                         data = baseline_data, 
                         family = binomial())
-summary(clinical_baeline)
+summary(clinical_baseline)
 
 # Model performance
 # predicted_probs
-pp_baseline <- predict(clinical_baeline, type = "response")
+pp_baseline <- predict(clinical_baseline, type = "response")
 # predicted_class
 pc_baseline <- ifelse(pp_baseline > 0.2, "Discontinue", "Continue")
 
@@ -189,7 +189,7 @@ bic_full <- BIC(full_model)
 print(bic_full)
 
 # Likelihood ratio test to compare models
-lr_test <- anova(clinical_baeline, full_model, test = "Chisq")
+lr_test <- anova(clinical_baseline, full_model, test = "Chisq")
 print(lr_test)
 ```
 
@@ -229,7 +229,7 @@ bic_baces <- BIC(baces_model)
 print(bic_baces)
 
 # Likelihood ratio test to compare models
-lr_test <- anova(clinical_baeline, baces_model, test = "Chisq")
+lr_test <- anova(clinical_baseline, baces_model, test = "Chisq")
 print(lr_test)
 ```
 
@@ -274,7 +274,6 @@ print(lr_test)
 lr_test <- anova(just_qaly, baces_model, test = "Chisq")
 print(lr_test)
 ```
-
 
 5. Cross-validation to evaluate robustness
 ```{r}
@@ -329,63 +328,6 @@ print(paste("Cross-validated AUC improvement with QSEQQALY:", round(cv_improveme
 ```
 
 Calibration
-```{r}
-n_groups = 10
-pred_groups <- cut(pp_baseline, 
-                   breaks = seq(0, 1, length.out = n_groups + 1), 
-                   include.lowest = TRUE)
-
-# Calculate observed event rate in each bin
-cal_data <- tibble(
-  predicted = pp_baseline,
-  observed = as.numeric(baseline_data$treatment_status == "Discontinue"),
-  group = pred_groups
-) %>%
-group_by(group) %>%
-summarise(
-  n = n(),
-  mean_pred = mean(predicted),
-  mean_obs = mean(observed),
-  se = sqrt((mean_obs * (1 - mean_obs)) / n)
-)
-
-# Calculate calibration metrics
-# Calibration-in-the-large (intercept)
-calibration_intercept <- with(cal_data, 
-                              weighted.mean(mean_obs - mean_pred, n))
-
-# Calibration slope
-cal_model <- glm(observed ~ predicted, 
-                data = tibble(
-                  predicted = pp_baseline,
-                  observed = as.numeric(baseline_data$treatment_status == "Discontinue")
-                ), 
-                family = binomial())
-calibration_slope <- coef(cal_model)[2]
-
-# Hosmer-Lemeshow test
-hl_test <- hoslem.test(as.numeric(baseline_data$treatment_status == "Discontinue"), 
-                       pp_baseline, 
-                       g = 10)
-
-# Create plot
-p <- ggplot(cal_data, aes(x = mean_pred, y = mean_obs)) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
-  geom_point(aes(size = n), alpha = 0.7) +
-  geom_errorbar(aes(ymin = mean_obs - 1.96*se, ymax = mean_obs + 1.96*se), width = 0.01) +
-  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1) +
-  labs(x = "Predicted Probability", 
-       y = "Observed Frequency", 
-       title = paste("Calibration Plot -", "Baseline Model"),
-       subtitle = paste0("Calibration intercept: ", round(calibration_intercept, 3),
-                        "\nCalibration slope: ", round(calibration_slope, 3),
-                        "\nHL test p-value: ", round(hl_test$p.value, 3))) +
-  theme_minimal() +
-  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
-  theme(legend.position = "bottom")
-p
-```
-
 ```{r}
 library(ResourceSelection) # For hoslem.test
 library(rms)  # For calibration metrics
@@ -446,7 +388,6 @@ create_calibration_plot <- function(predicted_probs, observed_outcomes, model_na
                          predicted_probs, 
                          g = 10)
   
-  # Create plot
   p <- ggplot(cal_data, aes(x = mean_pred, y = mean_obs)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
     geom_point(aes(size = n), alpha = 0.7) +
@@ -463,7 +404,7 @@ create_calibration_plot <- function(predicted_probs, observed_outcomes, model_na
     coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
     theme(legend.position = "bottom")
   
-  # Return both plot and metrics
+  # return plot + metrics
   return(list(
     plot = p,
     metrics = tibble(
@@ -501,18 +442,7 @@ cal_qaly <- create_calibration_plot(pp_qaly,
                                    "QALY Only")
 cal_qaly$plot
 
-# Combine all calibration metrics into a single table
-calibration_metrics <- bind_rows(
-  cal_baseline$metrics,
-  cal_full$metrics,
-  cal_baces$metrics,
-  cal_qaly$metrics
-)
-
-# Print summary table
-knitr::kable(calibration_metrics, digits = 3)
-
-# Create a 2x2 grid of all calibration plots
+# a 2x2 grid of all calibration plots
 library(gridExtra)
 grid.arrange(
   cal_baseline$plot + theme(legend.position = "none") + ggtitle("a) Clinical Parameters Only"),
@@ -525,49 +455,6 @@ grid.arrange(
 
 
 ```{r}
-# Create a function to evaluate metrics at different thresholds
-evaluate_threshold <- function(threshold, probs, actual) {
-  predicted <- ifelse(probs > threshold, "Discontinue", "Continue")
-  cm <- table(Predicted = predicted, Actual = actual)
-  
-  # Calculate metrics
-  sensitivity <- cm["Discontinue", "Discontinue"] / sum(cm[, "Discontinue"])
-  specificity <- cm["Continue", "Continue"] / sum(cm[, "Continue"])
-  accuracy <- sum(diag(cm)) / sum(cm)
-  
-  data.frame(
-    Threshold = threshold,
-    Sensitivity = sensitivity,
-    Specificity = specificity,
-    Accuracy = accuracy
-  )
-}
-
-# Evaluate multiple thresholds
-thresholds <- seq(0.1, 0.5, by = 0.05)
-threshold_results <- do.call(rbind, lapply(thresholds, function(t) {
-  evaluate_threshold(t, predicted_probs_full, baseline_data$treatment_status)
-}))
-
-# Display results
-print(threshold_results)
-
-# Graph
-threshold_results_long <- pivot_longer(threshold_results, 
-                                      cols = c(Sensitivity, Specificity, Accuracy),
-                                      names_to = "Metric",
-                                      values_to = "Value")
-
-ggplot(threshold_results_long, aes(x = Threshold, y = Value, color = Metric, group = Metric)) +
-  geom_line() +
-  geom_point() +
-  geom_vline(xintercept = 0.2, linetype = "dashed") +
-  labs(title = "Performance Metrics at Different Thresholds",
-       subtitle = paste("Optimal threshold:", round(optimal_threshold, 2)),
-       x = "Threshold", 
-       y = "Value") +
-  theme_bw()
-
 # Confusiong Matrix
 predicted_probs_full_wthreshold <- predict(full_model, type = "response")
 predicted_class_full_wthreshold <- ifelse(predicted_probs_full_wthreshold > 0.2, "Discontinue", "Continue")
@@ -631,13 +518,11 @@ coords_full <- coords(roc_full, threshold = 0.2) %>%
   slice(1)
 coords_baces <- coords(roc_baces, threshold = 0.2) %>%
   filter(threshold >= 0.2) %>%
-  slice(2)
+  slice(2) # modifying the threshold to better show the overlapping dots
 coords_qaly <- coords(roc_qaly, threshold = 0.2) %>%
   filter(threshold >= 0.2) %>%
   slice(1)
-```
 
-```{r}
 # ROC curves for all models
 roc_plot <- ggroc(list(
   "Baseline Model" = roc_baseline,
@@ -701,4 +586,39 @@ ggplot(baseline_data, aes(x = QSEQQALY, fill = CMQUIT_GROUP_2)) +
   theme(legend.position = "none")
 ```
 
+```{r}
+# T-test to compare QSEQQALY between treatment groups
+qaly_t_test <- t.test(QSEQQALY ~ treatment_status, 
+                      data = baseline_data, 
+                      alternative = "two.sided",
+                      var.equal = FALSE)  # Welch's t-test (doesn't assume equal variances)
+
+print(qaly_t_test)
+
+# Get summary statistics by group
+qaly_stats <- baseline_data %>%
+  group_by(treatment_status) %>%
+  summarise(
+    n = n(),
+    mean = mean(QSEQQALY, na.rm = TRUE),
+    sd = sd(QSEQQALY, na.rm = TRUE),
+    median = median(QSEQQALY, na.rm = TRUE),
+    q25 = quantile(QSEQQALY, 0.25, na.rm = TRUE),
+    q75 = quantile(QSEQQALY, 0.75, na.rm = TRUE)
+  )
+
+print(qaly_stats)
+
+# Create a boxplot to visualize the difference
+ggplot(baseline_data, aes(x = treatment_status, y = QSEQQALY, fill = treatment_status)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title = "Comparison of Baseline QALY Values by Treatment Outcome",
+    x = "Treatment Status",
+    y = "QSEQQALY (Quality-Adjusted Life Year)",
+    subtitle = paste("p-value =", format.pval(qaly_t_test$p.value, digits = 3))
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Continue" = "#AAAAEE", "Discontinue" = "#EEAAAA"))
+```
 
