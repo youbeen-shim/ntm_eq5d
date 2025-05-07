@@ -1,0 +1,1071 @@
+---
+title: "tobit_model_complete_rundown"
+author: "Youbeen Shim"
+date: "2025-05-01"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+# library(AER)  # tobit 
+library(VGAM) # tobit, alt
+library(survival) # 
+library(pscl) # zero-inflated models
+library(ggplot2)
+library(car) # VIF
+library(haven)
+library(lme4)
+library(lmerTest)  
+library(sjPlot) 
+library(dplyr)
+
+data <- read_csv("a) NTM-KOREA_EQ5D5L_QOLB_18m_20250309.csv")
+# A: 77  B: 62  C: 47 = total 186 명
+table(data$CMQUIT_GROUP_2)
+table(data$time)
+
+
+ggplot(data, aes(x = QSEQQALY)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of QSEQQALY")
+
+# Check for clustering at boundaries (0 and 1)
+sum(data$QSEQQALY == 0) / nrow(data) * 100  # percentage at 0
+sum(data$QSEQQALY == 1) / nrow(data) * 100  # percentage at 1
+sum(data$QSEQQALY >= 0.9 & data$QSEQQALY < 1) / nrow(data) * 100  # percentage at 0.9-0.999
+
+# Explore QSEQQALY by grouping variable
+ggplot(data, aes(x = CMQUIT_GROUP_2, y = QSEQQALY)) +
+  geom_boxplot() +
+  labs(title = "QSEQQALY by Group")
+
+# Correlation matrix of predictors
+cor_matrix <- data %>%
+  select(AGE, RFCTCAVI, VSBMI, LBESR) %>%
+  cor(use = "complete.obs")
+print(cor_matrix)
+
+
+```
+
+so the data above has something like a half of a normal curve, and then an aggressively aggregated 1 value. 
+we knew this, and we want to apply the censoring logic (there are probably values beyond 1)
+
+so we think that the tobit model is appropriate, but we want to check which variables to build the tobit 
+model with
+
+NOTE: all of the below modeling is done when time == B, i.e. only for the initial screening
+```{r}
+data <- data %>%
+  mutate(
+    CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
+    SEX = factor(SEX),
+    DMSMK = factor(DMSMK),
+    RFCTCAVI = factor(RFCTCAVI),
+    MBSPECIES = factor(MBSPECIES)
+  )
+
+# fit a separate!! tobit model with a single predictor variable
+# each model shows how one variable alone relateds to QALY - Also proxy to variable importance
+tobit_age <- AER::tobit(QSEQQALY ~ AGE, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_sex <- AER::tobit(QSEQQALY ~ SEX, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_smoke <- AER::tobit(QSEQQALY ~ DMSMK, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_cavi <- AER::tobit(QSEQQALY ~ RFCTCAVI, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_bmi <- AER::tobit(QSEQQALY ~ VSBMI, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_lbesr <- AER::tobit(QSEQQALY ~ LBESR, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_group <- AER::tobit(QSEQQALY ~ CMQUIT_GROUP_2, data = subset(data, time == "B"), left = 0, right = 1)
+tobit_mbspecies <- AER::tobit(QSEQQALY ~ MBSPECIES, data = subset(data, time == "B"), left = 0, right = 1)
+
+# For categorical variables, we need to get the overall significance rather than individual level p-values. 
+# we use likelihood ratio tests.
+
+null_model <- AER::tobit(QSEQQALY ~ 1, data = subset(data, time == "B"), left = 0, right = 1)
+
+# Get p-values for categorical variables
+p_sex <- anova(null_model, tobit_sex, test = "Chisq")
+p_smoke <- anova(null_model, tobit_smoke, test = "Chisq")
+p_cavi <- anova(null_model, tobit_cavi, test = "Chisq")
+p_group <- anova(null_model, tobit_group, test = "Chisq")
+# p_mbspecies <- anova(null_model, tobit_mbspecies, test = "Chisq")
+
+# p-values and AIC to compare
+summary_stats <- data.frame(
+  Variable = c("AGE", "SEX", "DMSMK", "RFCTCAVI", "VSBMI", "LBESR", "GROUP"), #"SPECIES"),
+  P_value = c(
+    summary(tobit_age)$coefficients[2,4],
+    p_sex$`Pr(>Chi)`[2],
+    p_smoke$`Pr(>Chi)`[2],
+    p_cavi$`Pr(>Chi)`[2],
+    summary(tobit_bmi)$coefficients[2,4],
+    summary(tobit_lbesr)$coefficients[2,4],
+    p_group$`Pr(>Chi)`[2]
+    # , p_mbspecies$`Pr(>Chi)`[2]
+  ),
+  AIC = c(
+    AIC(tobit_age), # for model fit (lower AIC = more desireable variable)
+    AIC(tobit_sex),
+    AIC(tobit_smoke),
+    AIC(tobit_cavi),
+    AIC(tobit_bmi),
+    AIC(tobit_lbesr),
+    AIC(tobit_group)
+    # , AIC(tobit_mbspecies) 
+  )
+)
+
+# Sort by AIC
+summary_stats %>% arrange(AIC)
+```
+Looking at above, RFCTCAVI (p=0.015) and LBESR (p=0.008) are statistically significant at the conventional 0.05 level
+All other variables, including GROUP, are not statistically significant in univariate models
+
+p-values here indicate stronger statistical significance, cavity size being the most significant predictor.
+
+Note that a major limitation here is that it only shows univariate level significance for variables that are
+not standardized/normalized. 
+
+Below, I am intending to separate the distribution of QALY scores by both time and group assignment. 
+Notably, while most of the shape remains consistent, for the treatment discontinued group, the rate at which the
+calculation comes out to 0.9 and 1.0 vary between time periods. 
+```{r}
+data <- data %>%
+  mutate(
+    time_factor = factor(time, levels = c("B", "6M", "1Y", "18M")),
+    time_numeric = case_when(
+      time == "B" ~ 0,
+      time == "6M" ~ 0.5,
+      time == "1Y" ~ 1,
+      time == "18M" ~ 1.5
+    ),
+    QSEQQALY_adj = ifelse(QSEQQALY >= 1, 0.9999, QSEQQALY)
+  )
+
+ggplot(data, aes(x = QSEQQALY, fill = CMQUIT_GROUP_2)) +
+  geom_histogram(bins = 20, alpha = 0.7) +
+  facet_grid(time_factor ~ CMQUIT_GROUP_2) +
+  labs(title = "Distribution of QALY by Time and Group")
+
+# Check for balancedness in your design
+table(data$CMQUIT_GROUP_2, data$time_factor)
+```
+Modeling issue
+Tobit modeling is not compatible with 
+
+
+Data quality issue
+
+
+```{r}
+b_data <- data %>% filter(time == "B")
+
+table(b_data$QSEQQALY, b_data$CMQUIT_GROUP_2)
+table(b_data$CMQUIT_GROUP_2)
+```
+
+```{r}
+data_check <- data %>%
+  select(QSEQQALY, time, AGE, SEX, VSBMI, LBESR, DMSMK, RFCTCAVI, MBSPECIES, CMQUIT_GROUP_2, SUBJNO)
+
+na_count_b <- sapply(data_check %>% filter(time == "B"), function(y) sum(length(which(is.na(y)))))
+na_count_6m <- sapply(data_check %>% filter(time == "6M"), function(y) sum(length(which(is.na(y)))))
+na_count_1y <- sapply(data_check %>% filter(time == "1Y"), function(y) sum(length(which(is.na(y)))))
+na_count_18m <- sapply(data_check %>% filter(time == "18M"), function(y) sum(length(which(is.na(y)))))
+
+na_count_b
+na_count_6m
+na_count_1y
+na_count_18m
+```
+
+
+```{r}
+library(brms)
+
+broom_data <- data %>%
+  # select(QSEQQALY, time, AGE, SEX, VSBMI, LBESR, DMSMK, RFCTCAVI, MBSPECIES, CMQUIT_GROUP_2, SUBJNO) %>%
+  select(QSEQQALY, time, AGE, SEX, VSBMI, DMSMK, MBSPECIES, CMQUIT_GROUP_2, SUBJNO) %>%
+  drop_na() %>%
+  mutate(censored = ifelse(QSEQQALY == 1, 1, 0))
+
+
+# Formula for your multilevel, longitudinal Tobit model with control variables
+formula <- bf(
+  QSEQQALY | cens(censored) ~ 
+    time * CMQUIT_GROUP_2 +  # Time by group interaction
+    AGE + SEX + VSBMI + DMSMK +  # Control variables
+    (1 + time | SUBJNO)  # Random intercept & slope for each patient
+)
+
+# Fit the model
+tobit_model <- brm(
+  formula = formula,
+  data = broom_data,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 4000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.95)  # Increases adaptation to avoid divergent transitions
+)
+```
+
+```{r}
+# Check model convergence
+summary(tobit_model)
+plot(tobit_model)
+
+# Check trace plots for MCMC chains
+mcmc_plot(tobit_model, type = "trace")
+
+# Posterior predictive checks
+pp_check(tobit_model)
+```
+
+
+```{r}
+# Formula for your multilevel, longitudinal Tobit model with control variables
+formula_simple <- bf(
+  QSEQQALY | cens(censored) ~ 
+    time * CMQUIT_GROUP_2 +  # Time by group interaction
+    AGE + SEX + VSBMI + DMSMK +  # Control variables
+    (1 | SUBJNO)  # Random intercept for each patient
+)
+
+# Fit the model
+tobit_model_simple <- brm(
+  formula = formula_simple,
+  data = broom_data,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 4000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.95)  # Increases adaptation to avoid divergent transitions
+)
+```
+
+```{r}
+# Check model convergence
+summary(tobit_model_simple)
+plot(tobit_model_simple)
+
+# Check trace plots for MCMC chains
+mcmc_plot(tobit_model_simple, type = "trace")
+```
+
+
+```{r}
+# Posterior predictive checks
+pp_check(tobit_model_simple)
+
+# First, extract posterior predictive samples
+posterior_samples <- posterior_predict(tobit_model_simple)
+
+# Extract observed values (including censored values)
+y_obs <- tobit_model_simple$data$QSEQQALY
+
+# Create a custom posterior predictive check plot
+# This requires ggplot2
+library(ggplot2)
+library(tidyverse)
+
+# Sample a subset of posterior draws (e.g., 10 draws)
+set.seed(123) # For reproducibility
+n_draws <- 10
+draw_indices <- sample(1:nrow(posterior_samples), n_draws)
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  value = c(y_obs, as.vector(posterior_samples[draw_indices,])),
+  type = c(rep("Observed", length(y_obs)), 
+           rep("Replicated", length(y_obs) * n_draws)),
+  draw = c(rep(NA, length(y_obs)), 
+           rep(1:n_draws, each = length(y_obs)))
+)
+
+# Create the density plot
+ggplot(plot_data, aes(x = value, color = type, group = interaction(type, draw))) +
+  geom_density(data = subset(plot_data, type == "Replicated"), 
+               aes(group = draw), size = 0.5, alpha = 0.3) +
+  geom_density(data = subset(plot_data, type == "Observed"), 
+               size = 1, alpha = 1) +
+  scale_color_manual(values = c("Observed" = "navy", "Replicated" = "lightblue")) +
+  labs(title = "Posterior Predictive Check",
+       x = "QALY Value", y = "Density") +
+  theme_minimal() +
+  coord_cartesian(xlim = c(0, 1.3)) # Adjust as needed
+```
+
+
+Looking at above, we can see a couple of things:
+
+1. Model Summary (Image 1)
+model shows excellent convergence with all Rhat values at 1.00, indicating the chains have mixed well. 
+
+The model successfully captured:
+Group differences:
+Groups B and C show different baseline QALY values compared to Group A (reference). 
+Group B has an average of -0.03 lower QALY (95% CI: -0.09, 0.04) and 
+Group C has -0.09 lower QALY (95% CI: -0.16, -0.02).
+
+Time effects: There's a decreasing trend in QALY over time for Group A (reference group):
+1Y: -0.01 (95% CI: -0.05, 0.03)
+6M: -0.02 (95% CI: -0.06, 0.02)
+B: -0.03 (95% CI: -0.06, 0.01)
+
+Group × Time interactions: 
+Group B shows positive interactions with time (suggests better trajectories compared to Group A):
+B×Group B: 0.02 (95% CI: -0.03, 0.08)
+6M×Group B: 0.06 (95% CI: -0.00, 0.12)
+1Y×Group B: 0.05 (95% CI: -0.01, 0.11)
+
+Group C shows a less dramatic, but overall negative interactions with time:
+B x C: 0.02 (-0.04, 0.08)
+6M x C: 0.03 (-0.03, 0.09)
+1Y x C: 0.00 (-0.06, 0.06)
+
+Control variables:
+SEX2 has a significant negative effect (-0.15, 95% CI: -0.22, -0.07)
+DMSMK1 has a significant negative effect (-0.12, 95% CI: -0.20, -0.03)
+VSBMI has a small positive effect (0.01, 95% CI: 0.00, 0.02)
+AGE has a negligible effect
+
+Random effects: The standard deviation for the random intercept (sd(Intercept)) is 0.14, indicating substantial between-patient variability.
+Residual error: Sigma is 0.11, which represents the residual variation after accounting for the fixed and random effects.
+
+Trace Plots (Images 2-6)
+The trace plots show excellent mixing of the MCMC chains:
+
+All chains appear to explore the same parameter space with good overlap
+No evidence of "stickiness" or autocorrelation
+No trends or patterns are visible that would suggest non-convergence
+The density plots (left side) show smooth, approximately normal posterior distributions
+No evidence of multimodality or other convergence issues
+
+overall - model converged well, and the posterior estimates are reliable.
+
+Posterior Predictive Check (Image 7)
+checking the effect of the right censoring at 1:
+
+The observed data (dark blue line, 'y') shows a sharp peak near 1, demonstrating the censoring effect
+The replicated data (light blue lines, 'y_rep') from the model don't capture this peak perfectly
+
+This discrepancy is expected and validates the choice of a Tobit model. 
+** The replicated data from the model represent what the uncensored data would look like, while the actual observed data show the censoring effect. This is precisely what the Tobit model is designed to handle.
+
+
+Clinical Interpretation
+From a clinical perspective, your model reveals several important findings:
+
+Group C performs worse than the reference group (A) in terms of QALY scores.
+Group B may have better trajectories over time than Group A, as evidenced by the positive interaction terms, though these are borderline significant.
+Sex and smoking status are important covariates affecting QALY scores, with both showing negative associations.
+BMI has a small positive association with QALY scores in this population.
+Individual variation is substantial, as shown by the random intercept variance, highlighting the importance of the multilevel approach.
+
+Statistical Validity
+The model appears statistically sound with:
+Good convergence (Rhat = 1.00 for all parameters)
+Adequate effective sample sizes (all Bulk_ESS > 2000, Tail_ESS > 3500)
+No divergences in the sampling
+Appropriate handling of the censoring mechanism
+
+```{r}
+# Get fitted values for each patient at each time point
+# This includes both fixed and random effects
+fitted_values <- fitted(tobit_model_simple, summary = TRUE)
+
+your_data <- broom_data
+
+# Add these fitted values to your original data
+your_data$fitted_qaly <- fitted_values[, "Estimate"]
+# your_data$fitted_qaly_lower <- fitted_values[, "Q2.5"]
+# your_data$fitted_qaly_upper <- fitted_values[, "Q97.5"]
+
+# Calculate group-level statistics based on individual fitted values
+# Calculate group summary statistics at each time point
+group_summary <- your_data %>%
+  mutate(time_continuous = case_when(
+    time == "B" ~ 0,
+    time == "6M" ~ 0.5,
+    time == "1Y" ~ 1,
+    time == "18M" ~ 1.5,
+    TRUE ~ NA_real_  # Handle any unexpected values
+  )) %>% 
+  group_by(CMQUIT_GROUP_2, time_continuous) %>%
+  summarize(
+    mean_qaly = mean(fitted_qaly),
+    q25_qaly = quantile(fitted_qaly, 0.25),
+    q75_qaly = quantile(fitted_qaly, 0.75),
+    sd_qaly = sd(fitted_qaly),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Create the plot with group trajectories and quantile-based "confidence intervals"
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
+
+ggplot(group_summary, aes(x = time_continuous, y = mean_qaly, color = CMQUIT_GROUP_2, fill = CMQUIT_GROUP_2)) +
+  geom_line(size = 1.5) +
+  # Add ribbons for the 25th to 75th percentile range
+  geom_ribbon(aes(x= time_continuous, ymin = q25_qaly, ymax = q75_qaly, fill = CMQUIT_GROUP_2), alpha = 0.2, colour = NA) +
+  # x-axis should match time scale (B=0, 6M=0.5, 1Y=1, 18M=1.5)
+  scale_x_continuous(
+    breaks = c(0, 0.5, 1, 1.5),
+    labels = c("B", "6M", "1Y", "18M")
+  ) +
+  labs(
+    title = "QALY Trajectories by Treatment Group",
+    subtitle = "Group Means with 25th-75th Percentile Ranges",
+    x = "Time",
+    y = "Quality-Adjusted Life Years (QALY)",
+    color = "Group",
+    fill = "Group"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  coord_cartesian(ylim = c(0.7, 1.1))
+```
+
+instead of the 25, 75th percentile values which display range of values, i want to use the Standard error of the mean (SEM) to visualize the uncertainty in the group mean.
+```{r}
+group_summary <- group_summary %>%
+  mutate(
+    # Create ±1 SD bounds (captures ~68% of data)
+    lower_bound = pmax(0, mean_qaly - sd_qaly),  # Ensure lower bound is not below 0
+    upper_bound = pmin(1, mean_qaly + sd_qaly)   # Ensure upper bound is not above 1
+  ) %>%
+  mutate(
+    sem = sd_qaly / sqrt(n),
+    lower_sem = pmax(0, mean_qaly - sem),
+    upper_sem = pmin(1, mean_qaly + sem)
+  ) %>% 
+  mutate(
+    # 95% CI using t-distribution
+    margin = qt(0.975, n-1) * (sd_qaly / sqrt(n)),
+    lower_ci = pmax(0, mean_qaly - margin),
+    upper_ci = pmin(1, mean_qaly + margin)
+  )
+
+ggplot(group_summary, aes(x = time_continuous, y = mean_qaly, color = CMQUIT_GROUP_2, fill = CMQUIT_GROUP_2)) +
+  geom_line(size = 1.5) +
+  # mean ± 1 SD
+  # geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound), alpha = 0.2, colour = NA) +
+  # SEM
+  # geom_ribbon(aes(ymin = lower_sem, ymax = upper_sem), alpha = 0.2, colour = NA) +
+  # 95% CI
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci), alpha = 0.2, colour = NA) +
+  scale_x_continuous(
+    breaks = c(0, 0.5, 1, 1.5),
+    labels = c("B", "6M", "1Y", "18M")
+  ) +
+  labs(
+    title = "QALY Trajectories by Treatment Group",
+    subtitle = "Group Means with 95% CI using t-distribution",
+    x = "Time",
+    y = "Quality-Adjusted Life Years (QALY)",
+    color = "Group",
+    fill = "Group",
+    caption = "Shaded areas represent 95% CI, meaning we are 95% confidence that the true group mean falls within this range"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  coord_cartesian(ylim = c(0.7, 1.1))
+```
+
+
+
+
+
+```{r}
+library(tidyverse)
+library(brms)
+
+# Assuming your model is called 'tobit_model'
+# First, create a prediction grid with your time values
+# I'll use your time variable structure, adjusting the approach
+
+# Create a sequence of time points for each group
+pred_data <- expand_grid(
+  CMQUIT_GROUP_2 = c("A", "B", "C"),
+  time = sort(unique(broom_data$time)),
+  # Add mean values for your control variables
+  AGE = mean(broom_data$AGE, na.rm = TRUE),
+  SEX = names(which.max(table(broom_data$SEX))), # Most common sex
+  VSBMI = mean(broom_data$VSBMI, na.rm = TRUE),
+  DMSMK = names(which.max(table(broom_data$DMSMK))) # Most common smoking status
+)
+
+# Generate predictions from the model
+# We use re_formula = NA to get population-level predictions (no random effects)
+predictions <- fitted(
+  tobit_model_simple, 
+  newdata = pred_data,
+  re_formula = NA,
+  summary = TRUE
+) %>% 
+  as_tibble() %>%
+  bind_cols(pred_data)
+
+# Define your color scheme
+group_colors <- c("A" = "#EEAAAA", "B" = "#AAAAEE", "C" = "#AAEEAA")
+
+# Create the plot
+tobit_plot <- ggplot(predictions, aes(x = time, y = Estimate, color = CMQUIT_GROUP_2)) +
+  # Main regression lines
+  geom_line(linewidth = 1) +
+  # Confidence interval ribbons
+  geom_ribbon(
+    aes(ymin = Q2.5, ymax = Q97.5, fill = CMQUIT_GROUP_2),
+    alpha = 0.2,
+    linetype = 0  # No border for the ribbon
+  ) +
+  # Customize appearance
+  labs(
+    title = "Health-Related Quality of Life Trends by Treatment Response Group",
+    x = "Time", 
+    y = "QALY weight",
+    color = "Response Group",
+    fill = "Response Group"
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_fill_manual(values = group_colors) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10)
+  )
+
+# Print the plot
+print(tobit_plot)
+```
+
+
+```{r}
+library(tidyverse)
+library(AER)  # For tobit models
+library(ggplot2)
+
+# Handle censoring at 1.0
+data <- data %>%
+  mutate(QSEQQALY_adj = ifelse(QSEQQALY >= 1, 0.999, QSEQQALY))
+
+# 2. Split data into the 12 groups
+groups <- list()
+for (t in c("B", "6M", "1Y", "18M")) {
+  for (g in c("A", "B", "C")) {
+    group_name <- paste0(t, "_", g)
+    groups[[group_name]] <- data %>% 
+      filter(time == t, CMQUIT_GROUP_2 == g)
+    
+    # Print sample size for this group
+    cat("Group", group_name, "has", nrow(groups[[group_name]]), "observations\n")
+  }
+}
+
+# 3. Variable selection for each group (optional, for simplicity)
+# For example, using AIC-based stepwise selection
+selected_vars <- list()
+tobit_models <- list()
+
+for (group_name in names(groups)) {
+  # Get data for this group
+  group_data <- groups[[group_name]]
+  
+  # Skip if sample size is too small
+  if (nrow(group_data) < 10) {
+    cat("Skipping group", group_name, "due to small sample size\n")
+    next
+  }
+  
+  # Full model with all variables
+  full_formula <- as.formula("QSEQQALY_adj ~ AGE + SEX + VSBMI + LBESR + DMSMK + RFCTCAVI")
+  
+  # Fit initial tobit model
+  full_model <- AER::tobit(full_formula, left = 0, right = 1, data = group_data)
+  
+  # Run step-wise selection (if sample size permits)
+  if (nrow(group_data) >= 20) {
+    step_model <- step(full_model, direction = "both", trace = FALSE)
+    final_model <- step_model
+    # Extract selected variables
+    selected_vars[[group_name]] <- attr(terms(step_model), "term.labels")
+  } else {
+    # For very small samples, use a simpler model
+    final_model <- tobit(QSEQQALY_adj ~ AGE + SEX, left = 0, right = 1, data = group_data)
+    selected_vars[[group_name]] <- c("AGE", "SEX")
+  }
+  
+  # Store final model
+  tobit_models[[group_name]] <- final_model
+  
+  # Print summary
+  cat("\n=== Tobit model for", group_name, "===\n")
+  print(summary(final_model))
+}
+
+# 4. Visualize predicted values for each group
+# Create a function to get predictions for a given value range
+get_predictions <- function(model, data, variable, range) {
+  # Create prediction grid
+  pred_data <- data %>% 
+    summarise(across(where(is.numeric), mean)) %>%
+    slice(rep(1, length(range)))
+  
+  # Set the variable of interest to the range values
+  pred_data[[variable]] <- range
+  
+  # Predict
+  preds <- predict(model, newdata = pred_data, type = "response")
+  
+  # Return data frame
+  return(data.frame(
+    x = range,
+    y = preds
+  ))
+}
+
+# Example: Plot effect of AGE on QSEQQALY for each group at baseline
+baseline_groups <- c("B_A", "B_B", "B_C")
+age_range <- seq(min(data$AGE), max(data$AGE), length.out = 100)
+
+age_effects <- data.frame()
+for (group_name in baseline_groups) {
+  if (!is.null(tobit_models[[group_name]])) {
+    preds <- get_predictions(tobit_models[[group_name]], 
+                            groups[[group_name]], 
+                            "AGE", 
+                            age_range)
+    preds$group <- group_name
+    age_effects <- rbind(age_effects, preds)
+  }
+}
+
+# Plot age effects
+ggplot(age_effects, aes(x = x, y = y, color = group)) +
+  geom_line() +
+  labs(title = "Effect of Age on QSEQQALY at Baseline by Group",
+       x = "Age", y = "Predicted QSEQQALY") +
+  theme_minimal()
+
+# 5. Create summary table of coefficients across all 12 models
+coef_table <- data.frame(
+  Group = character(),
+  Variable = character(),
+  Coefficient = numeric(),
+  StdError = numeric(),
+  PValue = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (group_name in names(tobit_models)) {
+  model <- tobit_models[[group_name]]
+  if (!is.null(model)) {
+    coefs <- summary(model)$coefficients
+    for (i in 1:nrow(coefs)) {
+      coef_table <- rbind(coef_table, data.frame(
+        Group = group_name,
+        Variable = rownames(coefs)[i],
+        Coefficient = coefs[i, 1],
+        StdError = coefs[i, 2],
+        PValue = coefs[i, 4]
+      ))
+    }
+  }
+}
+
+# Print and save coefficient summary
+print(coef_table)
+write.csv(coef_table, "tobit_coefficients_by_group.csv", row.names = FALSE)
+
+# 6. Generate predictions at representative values
+# For example, predict QSEQQALY for a typical patient in each group
+typical_patient <- data %>%
+  summarize(across(where(is.numeric), median))
+
+for (group_name in names(tobit_models)) {
+  if (!is.null(tobit_models[[group_name]])) {
+    pred <- predict(tobit_models[[group_name]], 
+                  newdata = typical_patient, 
+                  type = "response")
+    cat("Predicted QSEQQALY for typical patient in group", 
+        group_name, ":", pred, "\n")
+  }
+}
+```
+
+```{r}
+
+
+# Assuming your data is loaded as 'data' with columns for:
+# - patient_id: unique identifier for each patient
+# - time: B, 6M, 12M, 18M
+# - group: A, B, C
+# - QSEQQALY: your outcome variable
+# - Predictors: AGE, SEX, VSBMI, LBESR, DMSMK, RFCTCAVI
+
+# 1. Create a list to store all models
+all_models <- list()
+
+# 2. Create a copy of the original data to add predictions
+data_with_predictions <- data %>%
+  select(QSEQQALY, time, AGE, SEX, VSBMI, LBESR, DMSMK, RFCTCAVI, MBSPECIES, CMQUIT_GROUP_2, SUBJNO)
+
+
+na_count <- sapply(data_with_predictions %>% filter(time == "18M"), function(y) sum(length(which(is.na(y)))))
+na_count
+
+prediction_list <- list() 
+# 3. Split data and apply tobit models
+for (t in c("B", "6M", "1Y", "18M")) {
+  for (g in c("A", "B", "C")) {
+    # Create a subset for this time and group
+    subset_name <- paste0(t, "_", g)
+    
+    # Extract data for this subset
+    subset_data <- data %>% 
+      filter(time == t, CMQUIT_GROUP_2 == g)
+    
+    # Skip if there's not enough data
+    if (nrow(subset_data) < 10) {
+      warning(paste("Skipping", subset_name, "due to insufficient data"))
+      next
+    }
+    
+    # Fit tobit model
+    # Note: QSEQQALY is censored between 0 and 1
+    model <- AER::tobit(
+      QSEQQALY ~ AGE + SEX + VSBMI + LBESR + DMSMK + RFCTCAVI,
+      left = 0, 
+      right = 1, 
+      data = subset_data
+    )
+    
+    # Store the model
+    all_models[[subset_name]] <- model
+    
+    # Generate predictions
+    predictions <- predict(model, type = "response")
+    
+    # Store predictions in the list with identifiers
+    prediction_df <- subset_data %>%
+      select(SUBJNO, time, CMQUIT_GROUP_2) %>%
+      mutate(predicted_QSEQQALY = predictions)
+    
+    prediction_list[[subset_name]] <- prediction_df
+    
+    # Print summary for this model
+    cat("\n=== Model for", subset_name, "===\n")
+    print(summary(model))
+  }
+}
+
+# 4. Calculate model diagnostics for each subset
+model_diagnostics <- data.frame(
+  Model = character(),
+  Sample_Size = numeric(),
+  Sigma = numeric(),
+  LogLik = numeric(),
+  AIC = numeric(),
+  BIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (model_name in names(all_models)) {
+  model <- all_models[[model_name]]
+  
+  model_diagnostics <- rbind(model_diagnostics, 
+    data.frame(
+      Model = model_name,
+      Sample_Size = model$nobs,
+      Sigma = model$sigma,
+      LogLik = logLik(model),
+      AIC = AIC(model),
+      BIC = BIC(model),
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+# Print diagnostics table
+print(model_diagnostics)
+
+# 5. Compare predictions to original values
+data_with_predictions <- data_with_predictions %>%
+  mutate(prediction_error = QSEQQALY - predicted_QSEQQALY)
+
+# Calculate RMSE for each model
+error_summary <- data_with_predictions %>%
+  group_by(time, group) %>%
+  summarize(
+    RMSE = sqrt(mean(prediction_error^2, na.rm = TRUE)),
+    MAE = mean(abs(prediction_error), na.rm = TRUE),
+    Mean_Error = mean(prediction_error, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(error_summary)
+
+# 6. Visualize original vs predicted values
+ggplot(data_with_predictions, aes(x = QSEQQALY, y = predicted_QSEQQALY, color = group)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_grid(group ~ time, labeller = label_both) +
+  labs(
+    title = "Original vs Predicted QSEQQALY Values",
+    x = "Original QSEQQALY",
+    y = "Predicted QSEQQALY"
+  ) +
+  theme_minimal()
+
+# 7. Visualize coefficient estimates across all models
+# Extract coefficients from all models
+coef_data <- data.frame()
+
+for (model_name in names(all_models)) {
+  model <- all_models[[model_name]]
+  
+  # Split the model name into time and group
+  parts <- strsplit(model_name, "_")[[1]]
+  time <- parts[1]
+  group <- parts[2]
+  
+  # Extract coefficients
+  coefs <- coef(model)
+  
+  # Add to dataframe
+  for (var_name in names(coefs)) {
+    coef_data <- rbind(coef_data, 
+      data.frame(
+        Time = time,
+        Group = group,
+        Variable = var_name,
+        Coefficient = coefs[var_name],
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# Plot coefficients
+ggplot(coef_data %>% filter(Variable != "(Intercept)"), 
+       aes(x = Variable, y = Coefficient, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Time, ncol = 2) +
+  labs(
+    title = "Coefficient Estimates Across Time Points and Groups",
+    x = "Variable",
+    y = "Coefficient Estimate"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 8. Export results
+# Save the full dataset with predictions
+write.csv(data_with_predictions, "tobit_predictions.csv", row.names = FALSE)
+
+# Save model diagnostics
+write.csv(model_diagnostics, "tobit_model_diagnostics.csv", row.names = FALSE)
+
+# Save coefficient data
+write.csv(coef_data, "tobit_coefficient_estimates.csv", row.names = FALSE)
+```
+
+
+
+
+
+model building
+```{r}
+# Start with all variables
+full_model <- AER::tobit(QSEQQALY ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR + CMQUIT_GROUP_2, 
+                    left = 0, right = 1, 
+                    data = subset(data, time == "B"))
+summary(full_model)
+
+# Check for multicollinearity
+vif_values <- vif(lm(QSEQQALY ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR + CMQUIT_GROUP_2, data = data))
+print(vif_values)
+
+# Backward selection based on AIC
+step_model <- step(full_model, direction = "backward")
+summary(step_model)
+
+# Alternative approach: Create models with different subsets
+model1 <- tobit(QSEQQALY ~ GROUP + AGE + SEX, left = 0, right = 1, data = data)
+model2 <- tobit(QSEQQALY ~ GROUP + AGE + SEX + VSBMI, left = 0, right = 1, data = data)
+model3 <- tobit(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR, left = 0, right = 1, data = data)
+model4 <- tobit(QSEQQALY ~ GROUP + AGE + SEX + DMSMK + RFCTCAVI + VSBMI + LBESR, left = 0, right = 1, data = data)
+
+# Compare AIC
+aic_values <- c(AIC(model1), AIC(model2), AIC(model3), AIC(model4))
+models <- c("Group+Age+Sex", "Group+Age+Sex+BMI", "Group+Age+Sex+BMI+ESR", "All variables")
+aic_comparison <- data.frame(Model = models, AIC = aic_values)
+aic_comparison %>% arrange(AIC)
+
+```
+
+model transformation and alternatives
+```{r}
+# For heavily censored data, try a logit transformation
+data$QSEQQALY_adj <- ifelse(data$QSEQQALY >= 1, 0.999, data$QSEQQALY)
+data$QSEQQALY_logit <- log(data$QSEQQALY_adj/(1-data$QSEQQALY_adj))
+
+# Fit tobit on transformed data
+logit_model <- tobit(QSEQQALY_logit ~ GROUP + AGE + SEX + VSBMI + LBESR,
+                     data = data)
+summary(logit_model)
+
+# Alternative: Beta regression for values between 0 and 1
+# Requires the betareg package
+library(betareg)
+data$QSEQQALY_adj <- ifelse(data$QSEQQALY >= 1, 0.999, 
+                           ifelse(data$QSEQQALY <= 0, 0.001, data$QSEQQALY))
+beta_model <- betareg(QSEQQALY_adj ~ GROUP + AGE + SEX + VSBMI + LBESR, data = data)
+summary(beta_model)
+
+# Alternative: Fractional logit (using GLM with logit link)
+frac_logit <- glm(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR, 
+                  family = quasibinomial(link = "logit"), 
+                  data = data)
+summary(frac_logit)
+```
+
+validation
+```{r}
+# Create training and test sets
+set.seed(123)
+train_indices <- sample(1:nrow(data), 0.7 * nrow(data))
+train_data <- data[train_indices, ]
+test_data <- data[-train_indices, ]
+
+# Fit model on training data
+train_model <- tobit(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR, 
+                     left = 0, right = 1, 
+                     data = train_data)
+
+# Predict on test data
+# Need to handle the censoring in predictions
+predictions <- predict(train_model, newdata = test_data, type = "response")
+
+# Calculate performance metrics
+rmse <- sqrt(mean((predictions - test_data$QSEQQALY)^2, na.rm = TRUE))
+mae <- mean(abs(predictions - test_data$QSEQQALY), na.rm = TRUE)
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+
+# Cross-validation 
+library(caret)
+train_control <- trainControl(method = "cv", number = 5)
+cv_model <- train(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR, 
+                 data = data,
+                 method = "lm",  # Approximation since tobit isn't directly supported
+                 trControl = train_control)
+print(cv_model)
+```
+
+interpretation
+```{r}
+# Extract coefficients and confidence intervals
+coef_table <- summary(step_model)$coefficients
+conf_int <- confint(step_model)
+coef_data <- data.frame(
+  Variable = rownames(coef_table),
+  Estimate = coef_table[, 1],
+  StdError = coef_table[, 2],
+  LowerCI = conf_int[, 1],
+  UpperCI = conf_int[, 2],
+  PValue = coef_table[, 4]
+)
+
+# Calculate marginal effects (average partial effects)
+library(margins)
+margins_model <- margins(step_model)
+summary(margins_model)
+
+# Visualize coefficient effects
+ggplot(coef_data[-1,], aes(x = reorder(Variable, Estimate), y = Estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.2) +
+  coord_flip() +
+  labs(title = "Coefficient Estimates with 95% Confidence Intervals",
+       x = "Variable", y = "Estimate")
+
+# Visualize predicted QSEQQALY by GROUP, holding other variables at their means
+new_data <- expand.grid(
+  GROUP = unique(data$GROUP),
+  AGE = mean(data$AGE),
+  SEX = factor(levels(data$SEX)[1], levels = levels(data$SEX)),
+  VSBMI = mean(data$VSBMI),
+  LBESR = mean(data$LBESR)
+)
+new_data$predicted <- predict(step_model, newdata = new_data, type = "response")
+
+ggplot(new_data, aes(x = GROUP, y = predicted, fill = GROUP)) +
+  geom_col() +
+  labs(title = "Predicted QSEQQALY by Group")
+```
+
+stratify
+```{r}
+# For improved insights, consider stratifying by GROUP
+group_levels <- unique(data$GROUP)
+for (g in group_levels) {
+  group_data <- data %>% filter(GROUP == g)
+  group_model <- tobit(QSEQQALY ~ AGE + SEX + VSBMI + LBESR, 
+                      left = 0, right = 1, 
+                      data = group_data)
+  cat("\nResults for Group", g, ":\n")
+  print(summary(group_model))
+}
+```
+
+longitinal
+```{r}
+# If you have longitudinal data
+library(nlme)
+library(lme4)
+
+# Approximate with linear mixed effects model
+lmm_model <- lmer(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR + (1|SUBJECT_ID), 
+                 data = data)
+summary(lmm_model)
+
+# Or using a specific longitudinal tobit package if available
+# This is just a placeholder; implementation depends on specific packages
+# long_tobit <- long_tobit_function(QSEQQALY ~ GROUP + AGE + SEX + VSBMI + LBESR, 
+#                                  subject = "SUBJECT_ID", 
+#                                  data = data)
+```
+
+final
+```{r}
+# Select the best model based on AIC, BIC, and theoretical considerations
+final_model <- step_model  # Or whichever model you decide is best
+
+# Create a summary table for reporting
+final_summary <- data.frame(
+  Variable = rownames(summary(final_model)$coefficients),
+  Coefficient = summary(final_model)$coefficients[, 1],
+  StdError = summary(final_model)$coefficients[, 2],
+  PValue = summary(final_model)$coefficients[, 4],
+  Significance = ifelse(summary(final_model)$coefficients[, 4] < 0.05, "*", "")
+)
+
+# Export results
+write.csv(final_summary, "tobit_model_results.csv", row.names = FALSE)
+
+# Final visualizations for reporting
+# Observed vs Predicted
+data$predicted <- predict(final_model, type = "response")
+ggplot(data, aes(x = predicted, y = QSEQQALY)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Observed vs Predicted QSEQQALY Values")
+```
+
