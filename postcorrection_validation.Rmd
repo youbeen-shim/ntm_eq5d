@@ -72,8 +72,8 @@ baseline_data <- baseline_data %>%
     CMQUIT_GROUP_2 = factor(CMQUIT_GROUP_2, levels = c("A", "B", "C")),
     SEX = factor(SEX),
     DMSMK = factor(DMSMK),
-    RFCTCAVI = factor(RFCTCAVI),
-    MBSPECIES = factor(MBSPECIES)
+    RFCTCAVI = factor(RFCTCAVI)
+    # , MBSPECIES = factor(MBSPECIES)
   ) %>%
   drop_na() 
 
