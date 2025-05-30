@@ -77,9 +77,6 @@ baseline_data$treatment_status <- relevel(factor(baseline_data$treatment_status)
 
 summary(baseline_data)
 
-# species do not impact outcome, weridly does not even seem to be a powerful predictive variable
-# even though it is highly clinically relevant
-# limited value gain
 ```
 
 2. Baseline model without QALY
