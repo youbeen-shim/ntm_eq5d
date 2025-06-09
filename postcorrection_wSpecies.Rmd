@@ -77,7 +77,7 @@ baseline_data$treatment_status <- relevel(factor(baseline_data$treatment_status)
 
 summary(baseline_data)
 
-# comment
+# no comment
 ```
 
 2. Baseline model without QALY
