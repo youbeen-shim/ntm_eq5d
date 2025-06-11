@@ -76,8 +76,6 @@ baseline_data <- baseline_data %>%
 baseline_data$treatment_status <- relevel(factor(baseline_data$treatment_status), ref = "Continue")
 
 summary(baseline_data)
-
-# no comment
 ```
 
 2. Baseline model without QALY
@@ -88,6 +86,25 @@ baseline_model <- glm(treatment_status ~ AGE + SEX + DMSMK + RFCTCAVI + VSBMI + 
 
 # Model summary
 summary(baseline_model)
+
+# Assess model performance
+# Calculate predictions
+predicted_probs_baseline <- predict(baseline_model, type = "response")
+predicted_class_baseline <- ifelse(predicted_probs_baseline > 0.5, "Discontinue", "Continue")
+
+# Create confusion matrix
+confmat_baseline <- table(Predicted = predicted_class_baseline, 
+                        Actual = baseline_data$treatment_status)
+print(confmat_baseline)
+
+# accuracy
+accuracy_baseline <- sum(diag(confmat_baseline)) / sum(confmat_baseline)
+print(paste("Baseline model accuracy:", round(accuracy_baseline * 100, 2), "%"))
+
+# ROC and AUC for baseline model
+roc_baseline <- roc(baseline_data$treatment_status, predicted_probs_baseline, levels = c("Continue", "Discontinue"), direction = "<")
+auc_baseline <- auc(roc_baseline)
+print(paste("Baseline model AUC:", round(auc_baseline, 4)))
 
 # Assess model performance
 # Calculate predictions
