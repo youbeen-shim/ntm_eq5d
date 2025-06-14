@@ -203,8 +203,8 @@ tobit_model <- brm(
   family = gaussian(),
   chains = 4,
   cores = 4,
-  iter = 4000,
-  warmup = 1000,
+  iter = 12000,
+  warmup = 2000,
   control = list(adapt_delta = 0.95)  # Increases adaptation to avoid divergent transitions
 )
 ```
@@ -213,6 +213,7 @@ tobit_model <- brm(
 # Check model convergence
 summary(tobit_model)
 plot(tobit_model)
+
 
 # Check trace plots for MCMC chains
 mcmc_plot(tobit_model, type = "trace")
@@ -240,7 +241,7 @@ tobit_model_simple <- brm(
   cores = 4,
   iter = 4000,
   warmup = 1000,
-  control = list(adapt_delta = 0.95)  # Increases adaptation to avoid divergent transitions
+  control = list(adapt_delta = 0.97)  # Increases adaptation to avoid divergent transitions
 )
 ```
 
