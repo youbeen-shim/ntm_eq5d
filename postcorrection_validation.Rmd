@@ -516,9 +516,9 @@ coords_baseline <- coords(roc_baseline) %>%
 coords_full <- coords(roc_full, threshold = 0.2) %>%
   filter(threshold >= 0.2) %>%
   slice(1)
-coords_baces <- coords(roc_baces, threshold = 0.2) %>%
-  filter(threshold >= 0.2) %>%
-  slice(2) # modifying the threshold to better show the overlapping dots
+#coords_baces <- coords(roc_baces, threshold = 0.2) %>%
+#  filter(threshold >= 0.2) %>%
+#  slice(2) # modifying the threshold to better show the overlapping dots
 coords_qaly <- coords(roc_qaly, threshold = 0.2) %>%
   filter(threshold >= 0.2) %>%
   slice(1)
@@ -527,17 +527,17 @@ coords_qaly <- coords(roc_qaly, threshold = 0.2) %>%
 roc_plot <- ggroc(list(
   "Baseline Model" = roc_baseline,
   "Baseline + QALY" = roc_full,
-  "BACES + QALY" = roc_baces,
+  # "BACES + QALY" = roc_baces,
   "QALY" = roc_qaly
 )) +
   geom_point(aes(x = coords_baseline$specificity, y = coords_baseline$sensitivity), color = "red", size = 1) + 
   geom_point(aes(x = coords_full$specificity, y = coords_full$sensitivity), color = "red", size = 1) + 
-  geom_point(aes(x = coords_baces$specificity, y = coords_baces$sensitivity), color = "red", size = 1) + 
+  # geom_point(aes(x = coords_baces$specificity, y = coords_baces$sensitivity), color = "red", size = 1) + 
   geom_point(aes(x = coords_qaly$specificity, y = coords_qaly$sensitivity), color = "red", size = 1) + 
   labs(title = "ROC Curves for Treatment Discontinuation Prediction",
        subtitle = paste("AUC - Baseline:", round(auc_baseline, 3),
                         "| Baseline + QALY:", round(auc_full, 3),
-                        "| BACES + QALY:", round(auc_baces, 3),
+                       # "| BACES + QALY:", round(auc_baces, 3),
                         "| QALY:", round(auc_qaly, 3),
                         "\n",
                         "the 0.2 threshold level is marked with a red dot")) +
